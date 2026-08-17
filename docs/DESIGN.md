@@ -318,12 +318,171 @@ commit a sampled slice. Raw downloads are gitignored either way.
 
 ---
 
+### D-014 — Type erasure: virtual base for ownership, static types on the edges
+
+**The problem.** `Map<Trip, Fare>` and `Filter<Fare, Fare>` are unrelated types.
+A pipeline must own both in one container, iterate them (Stage 7 snapshots every
+operator), and connect them without losing type safety.
+
+**Chosen.** Split the problem in two, because it is two problems:
+
+- *Ownership and traversal* → erased. `std::vector<std::unique_ptr<OperatorBase>>`,
+  where `OperatorBase` is a non-template class whose only real job is to give
+  `unique_ptr` a virtual destructor to call.
+- *The data path* → static. `Operator<In, Out>::process(Record<In>&&,
+  Collector<Out>&)`. Types are known at wiring time, so a mismatched connection
+  is a compile error.
+
+One virtual call per record per operator. Accepted deliberately: this is a
+throughput system, and against per-record parsing, hashing, and state lookup a
+predicted indirect call is noise. Revisit only if Stage 9 says otherwise.
+
+**Rejected — A: fully static templates / CRTP.** Fastest possible; the compiler
+can inline an entire chain into one loop. Rejected on four counts, the last two
+fatal: topology must be known at compile time, so no runtime-built DAG; template
+error messages become genuinely unusable; **Stage 6 has no seam to insert a
+queue into** a chain welded together at compile time; and **Stage 7 cannot walk
+a compile-time chain** to snapshot it.
+
+*This is exactly the right design for a latency-critical system with fixed
+topology — it is what the author's limit-order-book engine uses. Same technique,
+opposite verdict, because the constraints differ. Worth stating in an interview.*
+
+**Rejected — B: `std::function` composition.** No performance advantage:
+`std::function` *is* type erasure with an indirect call, plus possible heap
+allocation. The real objection is that operators must be **objects with
+identity and state** — Stage 4 gives them keyed state, Stage 7 gives them
+`snapshot()`/`restore()`, Stage 6 gives them a name and a parallelism — and a
+callable can be asked none of that. Composition-by-capture also makes the graph
+implicit and untraversable.
+
+**Rejected — C: `std::variant` payload.** A closed set: every payload type in
+the system must be listed in one central header, so adding an operator means
+recompiling the world. `sizeof(variant)` is its largest alternative, so one 4 KB
+payload type taxes every record in a system built to move millions per second.
+And it does not even address operator storage.
+
+*Variants are right for genuinely closed sets. Stage 2's stream element — record,
+watermark, or barrier — is exactly that, and is expected to use one.*
+
+---
+
+### D-015 — Record ownership: value semantics with moves
+
+**Chosen.** `Record<T>` is an aggregate passed as `Record<T>&&`. Each operator
+takes ownership, transforms, and moves downstream. Exactly one owner at a time.
+
+**Rejected — `shared_ptr<Record>`.** Every hop is an atomic refcount increment
+and a matching decrement. Once Stage 6 puts operators on different threads,
+those atomics hit a cache line bouncing between cores, millions of times a
+second — and the contention *worsens* as threads are added, which is the exact
+inverse of the point of parallelism. It also implies shared mutable state.
+
+**Rejected — pool / arena allocation.** Avoids malloc entirely, but records
+crossing thread boundaries need either a thread-safe pool (locks or atomics,
+back to the previous problem) or per-thread pools with a migration story. Real
+complexity purchased before any measurement demands it. *This is the
+latency-project instinct and it is the wrong one here.* Revisit in Stage 9 if
+profiling says allocation is hot.
+
+**Known limitation.** Moves work for exactly one consumer. Branching DAGs and
+sliding windows (Stage 3, one record in five windows) require genuine copies.
+The interface therefore takes `Record<T>&&` unconditionally, and the *pipeline*
+owns the decision to copy on fan-out — keeping the common path free and
+confining copies to the code that knows a fan-out is happening.
+
+Enforced by test: `PipelineOwnershipTest.DoesNotCopyPayloadsOnTheSingleConsumerPath`
+fails if any payload is copied. A copy has no visible symptom other than lost
+throughput, so it is asserted rather than trusted.
+
+---
+
+### D-016 — `Timestamp` is a chrono type, not `std::int64_t`
+
+**Chosen.** `using Timestamp = std::chrono::sys_time<std::chrono::milliseconds>`.
+
+**Rejected.** Raw `std::int64_t` milliseconds, which is what Flink uses.
+
+**Rationale.** The type system then enforces the arithmetic windowing depends on:
+`Timestamp - Timestamp` yields a `Duration`, `Timestamp + Duration` yields a
+`Timestamp`, and **`Timestamp + Timestamp` does not compile**. That last one is
+the purchase: adding two timestamps is meaningless and is precisely the slip
+that window-boundary arithmetic invites. With `int64` it compiles silently and
+produces a window in the year 55000.
+
+Serialization is unaffected — `.time_since_epoch().count()` gives the `int64`
+back at the system boundary, in one place.
+
+---
+
+### D-017 — Push execution, not pull
+
+**Chosen.** Sources push records forward; operators are plain function calls.
+
+**Rejected.** Pull (iterator/`next()`) execution.
+
+**Rationale.** Data arrival is not under the consumer's control, so a pull model
+misrepresents the problem. Concretely: a pull operator must be **resumable**,
+which makes every operator a coroutine or a hand-written state machine. Fan-out
+is trivial when pushing (call two collectors) and requires buffering when
+pulling. Watermarks and barriers both originate at the source and travel
+forward, which is push's direction.
+
+**Accepted cost.** Pull gives backpressure free — a consumer only asks when
+ready. Push must be *given* backpressure via bounded queues. That is precisely
+why Stages 5 and 6 exist.
+
+---
+
+### D-018 — Linear chain now; general DAG deferred
+
+**Chosen.** `from(source).via(op).via(op).to(sink)`.
+
+**Rejected.** A branching DAG in Stage 1. Nothing in Stage 1 needs it, and
+branching is what forces the copy-on-fan-out logic. A chain is a special case of
+a DAG, so generalizing later is additive rather than a rewrite.
+
+---
+
+### D-019 — The builder deduces concrete node types, not base types
+
+**Problem found while building.** `from(std::unique_ptr<VectorSource<int>>)` did
+not compile against a parameter of `std::unique_ptr<Source<Out>>`. Template
+argument deduction requires an exact match and will not look through
+`unique_ptr<Derived>` to find `unique_ptr<Base>` — the derived-to-base
+conversion is only available *after* deduction succeeds.
+
+**Chosen.** Deduce the concrete type and recover the payload types from member
+aliases (`Source::OutputType`, `Sink::InputType`, `Operator::InputType/OutputType`),
+with a `static_assert` verifying the connection.
+
+**Consequence.** A mis-wired pipeline reports
+`operator input type does not match the previous stage's output type` instead of
+a page of overload-resolution failures.
+
+---
+
+### D-020 — Collectors are heap-allocated and owned by `unique_ptr`, not stored by value
+
+The builder wires stages by holding `Collector<Out>**` — the address of a
+not-yet-filled slot inside the previous stage's collector. This is what allows
+the pipeline to be *described* front-to-back while the connections are
+inherently back-to-front.
+
+Those slot pointers stay valid across `push_back` only because the vector holds
+`unique_ptr`s rather than collector objects: reallocation moves pointers and
+leaves the pointed-to objects at fixed addresses. Storing collectors by value
+would dangle every outstanding slot pointer on the next append. Recorded because
+it is a lifetime invariant that is invisible at the call site.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
 | ----- | ----------- | ------ |
 | 0 | Scaffolding, sanitizers, CI | **Complete** |
-| 1 | Core dataflow, type erasure | Not started |
+| 1 | Core dataflow, type erasure | **Complete** — 21 tests, clean under dev/gcc/asan/tsan |
 | 2 | Event time and watermarks | Not started |
 | 3 | Windowing | Not started |
 | 4 | Keyed state, backend, serialization | Not started |

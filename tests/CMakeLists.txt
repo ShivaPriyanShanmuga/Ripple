@@ -1,15 +1,20 @@
 include(GoogleTest)
 
-add_executable(scaffolding_test scaffolding_test.cpp)
-target_link_libraries(scaffolding_test
-    PRIVATE
-        GTest::gtest_main
-        ripple::warnings
-        Threads::Threads
-)
+# Every test target gets the same dependencies. A function keeps that in one
+# place, so adding a test in a later stage is a single line.
+function(ripple_add_test name)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name}
+        PRIVATE
+            ripple::ripple
+            ripple::warnings
+            GTest::gtest_main
+            Threads::Threads
+    )
+    gtest_discover_tests(${name})
+endfunction()
 
-# gtest_discover_tests runs the binary at build time and registers each TEST()
-# with CTest individually, rather than as one opaque "run the whole binary"
-# entry. That means a failure names the specific test, and CTest can run them
-# in parallel.
-gtest_discover_tests(scaffolding_test)
+ripple_add_test(scaffolding_test)
+ripple_add_test(record_test)
+ripple_add_test(operators_test)
+ripple_add_test(pipeline_test)

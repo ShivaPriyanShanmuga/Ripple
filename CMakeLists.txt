@@ -113,8 +113,31 @@ if(RIPPLE_ENABLE_CLANG_TIDY)
     message(STATUS "clang-tidy enabled: ${RIPPLE_CLANG_TIDY_EXE}")
 endif()
 
-# The `ripple` library target is created in Stage 1, when there is a first
-# source file to put in it.
+# ---------------------------------------------------------------------------
+# The engine
+#
+# One static library rather than one target per subsystem. Splitting later is
+# mechanical; merging later is not, and per-stage targets would invent
+# dependency-direction problems before there are dependencies.
+#
+# Most of the engine is templates and therefore headers. `src/` holds the
+# non-template definitions, which is what makes this a compiled library rather
+# than a header-only one -- worth having for the link-time checking and the
+# incremental rebuild behaviour.
+# ---------------------------------------------------------------------------
+add_library(ripple STATIC
+    src/pipeline.cpp
+)
+add_library(ripple::ripple ALIAS ripple)
+
+target_include_directories(ripple PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_compile_features(ripple PUBLIC cxx_std_20)
+
+# PRIVATE: our warning set governs how *we* compile, and must not be forced on
+# anything that merely consumes the library.
+target_link_libraries(ripple PRIVATE ripple::warnings)
 
 if(RIPPLE_BUILD_TESTS)
     enable_testing()

@@ -95,6 +95,71 @@ last section is the revision list.
   Also: the oracle is a *differential* test — it proves parallel equals
   sequential, not that either is correct.
 
+---
+
+## Stage 1 — Core dataflow and type erasure
+
+### Concepts covered
+
+- **The type-erasure problem.** Storing and operating on a heterogeneous set of
+  operators whose input/output types differ, in a statically typed language.
+- **Four designs and their tradeoffs** — CRTP/static chaining, `std::function`
+  composition, `std::variant` payloads, virtual base with typed edges. See
+  D-014 in DESIGN.md; be able to give the rejection reason for each.
+- **Splitting one problem into two.** Ownership/traversal needs erasure; the
+  data path does not. Recognizing that they are separable is the key move.
+- **Move semantics in anger.** Why `Record<T>&&` states a contract rather than
+  an optimization; use-after-move; that `std::move` on a `const` object silently
+  copies because `std::move` is only a cast and a const rvalue cannot bind to
+  `T&&`; that an un-`noexcept` move constructor makes `std::vector` *copy* on
+  reallocation to preserve the strong exception guarantee.
+- **Ownership models and their costs.** Value+move vs. `shared_ptr` (atomic
+  refcount contention that worsens with thread count) vs. pooling (lifetime
+  complexity at thread boundaries).
+- **Push vs. pull at the implementation level.** Pull requires resumable
+  operators — coroutines or state machines. Push does not, but must be given
+  backpressure.
+- **Chrono as a type-safety tool**, not just a clock: making
+  `Timestamp + Timestamp` a compile error.
+- **Template argument deduction does not see through inheritance.**
+  `unique_ptr<Derived>` will not deduce against `unique_ptr<Base<T>>`; the
+  conversion is available only after deduction succeeds. Solved with member type
+  aliases plus `static_assert`.
+- **Pointer stability under vector growth.** Why the pipeline's wiring slots
+  survive `push_back` — the vector holds `unique_ptr`s, so reallocation moves
+  pointers and leaves objects at fixed addresses.
+
+### Questions to be able to answer cold
+
+These were not asked interactively (the stage-gate quiz was suspended at the
+author's request); they are the checklist for the revision pass.
+
+1. Why does a compile-time operator chain (CRTP) make Stage 6 and Stage 7
+   impossible, specifically? *(No seam to insert a queue; no runtime collection
+   to walk for snapshotting.)*
+2. `std::function` and virtual dispatch cost roughly the same. So what is the
+   actual argument against `std::function`-based operators?
+3. Why is `std::variant` right for Stage 2's stream element but wrong for record
+   payloads?
+4. Where does the atomic contention in `shared_ptr<Record>` come from, and why
+   does it get *worse* as you add threads?
+5. Name two cases where the move-only ownership model must fall back to a copy,
+   and say where that copy belongs.
+6. A colleague marks a payload type's move constructor without `noexcept`.
+   Throughput drops. Why?
+7. Why does `from(std::make_unique<VectorSource<int>>(...))` fail to compile
+   against a `unique_ptr<Source<Out>>` parameter?
+
+### Struggled with — revision list
+
+- Not yet assessed. Stage 1 was built without the comprehension gate; these
+  concepts have not been tested and should be treated as **unverified** during
+  the revision pass.
+
+---
+
+## Cross-stage themes
+
 ### Recurring theme worth naming in an interview
 
 Two of the three questions were about the same underlying idea: **a check that
