@@ -5,6 +5,7 @@
 #include <ripple/record.hpp>
 #include <ripple/sink.hpp>
 #include <ripple/source.hpp>
+#include <ripple/watermark.hpp>
 
 #include <cassert>
 #include <cstddef>
@@ -34,6 +35,11 @@ public:
         operator_->process(std::move(record), *downstream_);
     }
 
+    void emit_watermark(Watermark watermark) override {
+        assert(downstream_ != nullptr && "pipeline was not fully wired");
+        operator_->on_watermark(watermark, *downstream_);
+    }
+
     [[nodiscard]] Collector<Out>** downstream_slot() noexcept { return &downstream_; }
 
 private:
@@ -49,6 +55,8 @@ public:
     explicit SinkCollector(Sink<In>& sink) noexcept : sink_(&sink) {}
 
     void collect(Record<In>&& record) override { sink_->write(std::move(record)); }
+
+    void emit_watermark(Watermark watermark) override { sink_->on_watermark(watermark); }
 
 private:
     Sink<In>* sink_;
@@ -79,6 +87,16 @@ public:
     void run() override {
         assert(head_ != nullptr && "pipeline has no sink");
         source_->run(*head_);
+
+        // The input is exhausted, so nothing further can ever arrive. Emitting
+        // a watermark at the maximum timestamp forces every window still open
+        // downstream to fire.
+        //
+        // Without this, a finite job would silently drop its final windows:
+        // records would have been consumed, results would look plausible, and
+        // the last few minutes of every run would simply be missing. The
+        // failure is quiet and only visible if you know the expected totals.
+        head_->emit_watermark(kEndOfStreamWatermark);
     }
 
     [[nodiscard]] Collector<Out>** head_slot() noexcept { return &head_; }

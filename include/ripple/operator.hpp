@@ -2,6 +2,7 @@
 
 #include <ripple/collector.hpp>
 #include <ripple/record.hpp>
+#include <ripple/watermark.hpp>
 
 #include <string_view>
 
@@ -51,6 +52,21 @@ public:
     /// Consumes `record`. The `&&` states that ownership transfers in: the
     /// caller has given up the record and will not read it again.
     virtual void process(Record<In>&& record, Collector<Out>& out) = 0;
+
+    /// Reacts to event-time progress.
+    ///
+    /// The default -- forward it unchanged -- is correct for the majority of
+    /// operators. Map and filter have no notion of time and should not have to
+    /// mention watermarks at all; that is why this is a separate virtual with a
+    /// default body rather than a variant every operator must dispatch on.
+    ///
+    /// Stage 3's window operator overrides this: a watermark passing a window's
+    /// end is exactly the signal to fire that window, emit its result, and free
+    /// its state. An override MUST still forward the watermark afterwards, or
+    /// event time stops advancing for everything downstream.
+    virtual void on_watermark(Watermark watermark, Collector<Out>& out) {
+        out.emit_watermark(watermark);
+    }
 };
 
 } // namespace ripple

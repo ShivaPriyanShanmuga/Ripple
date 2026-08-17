@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ripple/record.hpp>
+#include <ripple/watermark.hpp>
 
 namespace ripple {
 
@@ -40,6 +41,20 @@ public:
     /// Takes ownership of the record. The rvalue reference is the contract:
     /// after calling this, the caller must not read the record again.
     virtual void collect(Record<T>&& record) = 0;
+
+    /// Sends a watermark down the same path, in the same order, as records.
+    ///
+    /// This ordering is the entire mechanism. Because a watermark travels
+    /// through the identical channel as the records ahead of it and cannot
+    /// overtake them, an operator receiving watermark T knows every record with
+    /// event time <= T has already passed through *it specifically*. No global
+    /// clock, no coordination, no central authority -- each operator infers
+    /// event-time progress from its own input alone.
+    ///
+    /// A separate side-channel for watermarks would destroy this. The watermark
+    /// could then arrive before records it claims to cover, and a window would
+    /// fire while its own data was still in flight.
+    virtual void emit_watermark(Watermark watermark) = 0;
 };
 
 } // namespace ripple

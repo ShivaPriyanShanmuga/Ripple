@@ -158,6 +158,77 @@ author's request); they are the checklist for the revision pass.
 
 ---
 
+## Stage 2 — Event time and watermarks
+
+### Concepts covered
+
+- **What a watermark asserts, and what it does not.** "No record with event time
+  <= T will arrive on this channel from now on" is a *heuristic produced by a
+  chosen strategy*, not a guarantee. Records older than T still arrive; they are
+  late, and Stage 3 decides their fate.
+- **Bounded out-of-orderness, correctly understood.** The bound measures how
+  jumbled the *arrival stream* is — how far behind the newest event time an
+  arriving record's event time may be. It is not a claim that any timestamp is
+  wrong or late. An event time is stamped when the thing happened and is never
+  wrong.
+- **The latency-vs-completeness dial.** A large bound gives complete results
+  late; a small bound gives fast results with more records missing their window.
+  There is no correct value — it is a business decision.
+- **Why watermarks travel in-band.** They cannot overtake the records ahead of
+  them, so watermark T arriving at an operator proves every record <= T has
+  already passed through that operator. No global clock. A side-channel would
+  destroy the property.
+- **Minimum across input channels.** You are only as caught up as your slowest
+  input. Maximum would be catastrophic, not merely wrong.
+- **The idle-channel stall.** A silent input freezes the minimum, so windows stop
+  firing and output stops while the job looks healthy. Expected behaviour of the
+  rule, not a bug.
+- **Ordering: record before watermark.** Emitting the watermark first makes a
+  record late against a watermark its own arrival produced.
+- **Monotonicity.** A regressing watermark re-opens a window that already fired,
+  producing a contradictory duplicate result.
+- **End-of-stream watermark.** Finite input must emit a maximal watermark or the
+  final windows silently vanish.
+- **Interface design: separate virtual vs. variant.** Why `on_watermark` with a
+  default forwarding body beats a variant every operator must dispatch on — and
+  why the variant is still correct at the Stage 6 transport layer.
+
+### Questions to be able to answer cold
+
+1. What exactly does a watermark guarantee? (Trick question — state precisely
+   what it does and does not promise.)
+2. Why must an operator take the minimum of its input watermarks rather than the
+   maximum? Describe the concrete data loss if you took the maximum.
+3. Your job's output stopped, but records are still flowing and there are no
+   errors. What is your first hypothesis and why?
+4. What breaks if the watermark is emitted before the record that produced it?
+   Why is that bug hard to notice?
+5. Why does map need no watermark-handling code at all, and what would the
+   variant-based design have cost here?
+6. A window operator overrides `on_watermark` to fire its windows and forgets to
+   forward the watermark. What happens downstream?
+7. Why does a finite job need an end-of-stream watermark, and what does the
+   output look like without one?
+8. Bounded out-of-orderness is set to 30 seconds. A record arrives whose event
+   time is 45 seconds behind the maximum seen. What happens, and whose fault is
+   it?
+
+### Struggled with — revision list
+
+- **Bounded out-of-orderness terminology** was a genuine point of confusion
+  during the Stage 0 debrief: the question was raised of why event time would be
+  "30 seconds late" when event time is stamped at occurrence and never changes.
+  The resolution — the bound describes disorder in *arrival order*, not error in
+  any timestamp — is worth re-deriving rather than memorising.
+- **The idle-source stall** was spotted independently ("what if there is no event
+  at that moment?"), which is the right instinct. Make sure the *fix* is also
+  known: idleness detection marking a channel as not participating in the
+  minimum, or advancing the watermark from the wall clock during quiet periods.
+- Everything else in this stage is **unverified** — built without the
+  comprehension gate.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

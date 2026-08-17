@@ -477,13 +477,124 @@ it is a lifetime invariant that is invisible at the call site.
 
 ---
 
+### D-021 — Watermarks as a separate virtual method, not a variant element
+
+**The Stage 1→2 seam, resolved.** Operators now need to see two kinds of thing.
+Two ways to express that:
+
+**Chosen.** A second virtual, `on_watermark(Watermark, Collector<Out>&)`, with a
+default body that forwards the watermark downstream unchanged.
+
+**Rejected — `process(std::variant<Record<T>, Watermark>&&)`.** It would force
+*every* operator to dispatch on the alternative, including map and filter, which
+have no notion of time and should not have to mention watermarks at all. The
+default-forwarding virtual gives them the correct behaviour for free: neither
+`MapOperator` nor `FilterOperator` changed by a single line in this stage.
+
+**Note for Stage 6.** The variant is still coming, at a different layer. A
+bounded queue between threads has to *transport* one element type, and that
+element is `Record | Watermark | Barrier` — a genuinely closed set defined by the
+engine, which is exactly what D-014 said variants are right for. Interface shape
+and transport shape are separate decisions.
+
+**Consequence for Stage 3.** A window operator overriding `on_watermark` **must
+still forward the watermark** after firing its windows. Forgetting to is a
+plausible bug with a nasty signature: event time stops advancing for everything
+downstream, so the pipeline holds state forever and produces no output while
+looking entirely healthy.
+
+---
+
+### D-022 — Watermark generation is an operator, not logic inside `Source`
+
+**Chosen.** `BoundedOutOfOrdernessWatermarks<T>`, an `Operator<T, T>` placed
+immediately after the source.
+
+**Rejected.** Building generation into the `Source` base class.
+
+**Rationale.** The strategy becomes pluggable and independently unit-testable,
+and sources stay concerned only with producing records. This is also what Flink
+does in practice, despite the concept being described as source-level.
+
+---
+
+### D-023 — The record is emitted before the watermark derived from it
+
+The single most consequential line-ordering decision in the stage.
+
+`process()` forwards the record, *then* computes and emits any watermark.
+Reversed, a record's own arrival would produce a watermark that renders that
+same record late: downstream, a window could close and free its state one
+instant before receiving a record that belonged in it.
+
+The failure mode is why this is asserted rather than trusted. It is invisible in
+aggregate — record counts stay correct, no error is raised, and only the
+boundary records of each window quietly land in the wrong place or vanish.
+
+Enforced by `BoundedOutOfOrdernessTest.EmitsTheRecordBeforeTheWatermarkItProduces`,
+which uses a zero lag so the generated watermark exactly equals the record's own
+event time, making any ordering slip observable.
+
+---
+
+### D-024 — Watermarks are emitted only when they advance
+
+The generator tracks the **maximum** event time seen, not the most recent, and
+emits only when `max - bound` exceeds the last emitted watermark.
+
+Tracking the most recent event time instead would make the watermark oscillate
+with every straggler. A regressing watermark re-opens a window that has already
+fired, producing a second, contradictory result for a period that was supposed
+to be complete. `WatermarkTracker` enforces the same invariant per channel
+rather than trusting its inputs.
+
+---
+
+### D-025 — End of input emits a maximal watermark
+
+When `Source::run` returns, the runner emits `Watermark{kMaxTimestamp}`.
+
+Without it, a finite job silently drops whatever windows were still open when
+the input ran out — the last few minutes of every run simply missing, with no
+error and plausible-looking totals. Also emitted for an empty input, so a source
+that produces nothing still terminates event time downstream rather than leaving
+operators waiting forever.
+
+---
+
+### D-026 — `WatermarkTracker` built now, consumed in Stage 6
+
+The minimum-across-input-channels rule is the conceptual core of watermark
+propagation and belongs to this stage, but Stage 2's topology is a linear chain,
+so no operator yet has more than one input.
+
+**Decision:** build and fully test it now as a self-contained unit; wire it in
+when Stage 6 introduces fan-in. Recorded as a deliberate exception to the
+otherwise strict no-building-ahead rule, on the grounds that the alternative is
+a stage that omits its own central concept.
+
+**Why minimum and not maximum.** Taking the maximum is the natural-looking
+mistake and is catastrophic rather than merely wrong: the operator would claim
+to have seen everything up to the *fastest* channel's time, fire windows on that
+basis, then receive perfectly on-time records from the slower channel that now
+look late — silent data loss proportional to how far the channels have diverged.
+
+**The pathology this rule implies, asserted deliberately in
+`IdleChannelStallsProgress`:** a channel that goes silent stops advancing its
+watermark, so the minimum stops advancing, so every downstream window stops
+firing. Records keep flowing, nothing errors, and output simply stops. Knowing
+this is the *expected* consequence of the minimum rule rather than a bug is what
+makes it diagnosable in production.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
 | ----- | ----------- | ------ |
 | 0 | Scaffolding, sanitizers, CI | **Complete** |
 | 1 | Core dataflow, type erasure | **Complete** — 21 tests, clean under dev/gcc/asan/tsan |
-| 2 | Event time and watermarks | Not started |
+| 2 | Event time and watermarks | **Complete** — 32 tests, clean under dev/gcc/asan/tsan |
 | 3 | Windowing | Not started |
 | 4 | Keyed state, backend, serialization | Not started |
 | 5 | Concurrency primitives | Not started |

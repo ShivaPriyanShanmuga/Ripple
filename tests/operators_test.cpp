@@ -3,6 +3,7 @@
 #include <ripple/operators/map.hpp>
 #include <ripple/record.hpp>
 #include <ripple/timestamp.hpp>
+#include <ripple/watermark.hpp>
 
 #include <gtest/gtest.h>
 
@@ -21,7 +22,10 @@ class TestCollector final : public ripple::Collector<T> {
 public:
     void collect(Record<T>&& record) override { received.push_back(std::move(record)); }
 
+    void emit_watermark(ripple::Watermark watermark) override { watermarks.push_back(watermark); }
+
     std::vector<Record<T>> received;
+    std::vector<ripple::Watermark> watermarks;
 };
 
 // Protects: map applies the function to the payload.
