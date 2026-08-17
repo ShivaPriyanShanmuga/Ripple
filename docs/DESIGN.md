@@ -1718,6 +1718,73 @@ distribution over runs, which is the obvious next improvement to it.
 
 ---
 
+### D-073 — An operator that threw deadlocked the whole pipeline
+
+**A real bug, found by asking "what if an operator throws?" and testing it rather
+than reasoning about it.** It deadlocked, in two independent places.
+
+`run_subtask` announced end-of-channel as the *last statement of the function*,
+so an exception skipped it. The fan-in sink counts one `EndOfChannel` per channel
+before exiting, so it waited forever for a channel that would never report -- and
+`WorkerGroup`'s destructor then joined that thread. Behind that sat a second
+deadlock: the source kept pushing into the dead subtask's input queue until it
+filled, then blocked in `push` forever.
+
+Both are the same mistake, and it is one this project already had a rule against:
+**cleanup written as a statement is cleanup the exception path skips.** It is
+exactly the argument for `jthread` over `thread` in D-046, applied to channels
+instead of threads, and it was missed because no test ever made an operator fail.
+
+**Fixed with RAII.** `SubtaskExitGuard` closes the input queue and announces
+end-of-channel from a destructor, so both happen on every exit path. The input
+queue is closed first so the source unblocks promptly. The sink got the mirror
+treatment -- a `QueueCloser` -- because a sink that throws would otherwise leave
+every subtask blocked pushing into a queue nobody drains.
+
+**And the source now stops on a failed push.** A closed queue mid-run means that
+subtask has died; continuing would silently drop every record routed to that
+partition and then report a clean finish over incomplete results.
+
+**`ParallelMetrics::worker_failures` exists because of the second half of the
+problem.** Shutting down cleanly on failure is only an improvement if the caller
+can tell it happened -- otherwise the engine has converted a hang into a silent,
+incomplete result, which is worse. A hang is at least honest.
+
+Five regression tests, including a negative control asserting a healthy run
+reports no failures. Every test target carries a CTest timeout, so a regression
+fails the build rather than hanging CI.
+
+---
+
+### D-074 — Randomized property tests for windowing
+
+Every other window test is hand-written: a specific input probing a specific
+boundary. Those confirm behaviour someone already thought of and are useless
+against behaviour nobody did. Four seeded property tests now assert things that
+must hold for *any* input:
+
+- **Conservation** — every record is either counted in exactly one window or
+  reported late; never both, never neither. Checked across 25 random combinations
+  of window size, watermark bound, allowed lateness and jitter. A violation
+  either inflates results or loses data silently.
+- **Differential** — with a bound wide enough that nothing can be late, output
+  must match a three-line direct grouping of the input. Removing lateness is what
+  makes the reference trivially auditable.
+- **Order invariance** — shuffling arrival order must not change the answer.
+  This is the entire justification for event time, expressed as a property.
+- **Memory** — with 5,000 keys, all window and key state must be released once
+  every window expires.
+
+Seeded so a counterexample is reproducible, for the same reason the fault
+injection harness fixes its seed.
+
+**What this closes:** the windowing semantics were previously covered only by
+examples. The conservation property in particular is the kind of invariant that
+hand-written tests cannot practically establish, because the interesting cases
+are combinations nobody would think to write down.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |

@@ -155,6 +155,14 @@ struct ParallelMetrics {
     /// measured and looks like a uniformly slow pipeline.
     std::chrono::steady_clock::time_point source_started_at{};
 
+    /// Workers that terminated by throwing. **Empty means the run completed.**
+    ///
+    /// Exposed because the alternative is a failed run that looks like a
+    /// successful one: the engine now shuts down cleanly when an operator
+    /// throws instead of deadlocking, and without this the caller could not tell
+    /// that outcome from a normal finish.
+    std::vector<WorkerFailure> worker_failures;
+
     /// How many elements the sink set aside while waiting for a barrier to
     /// arrive on every channel. This is the **cost of alignment** made visible: a
     /// large number means one subtask is lagging and the rest are stalled on it.
@@ -228,6 +236,7 @@ public:
 
         std::vector<std::size_t> records_per_subtask(parallelism, 0);
         SinkTask sink_task(parallelism, parallelism, coordinator);
+        std::vector<WorkerFailure> failures;
 
         {
             WorkerGroup workers;
@@ -335,14 +344,62 @@ public:
             for (auto& queue : input_queues) {
                 queue->close();
             }
+
+            // Joined explicitly rather than left to the destructor: the failure
+            // list is only meaningful once every worker has finished, and
+            // reading it first reports an empty list for a run that failed.
+            // `join()` is idempotent, so the destructor's join is a no-op.
+            workers.join();
+            failures = workers.failures();
         } // workers joined here
 
+        metrics_.worker_failures = std::move(failures);
         collect_metrics(input_queues, sink_queue, records_per_subtask, sink_task);
     }
 
     [[nodiscard]] const ParallelMetrics& metrics() const noexcept { return metrics_; }
 
 private:
+    /// Terminates a subtask's channels on **every** exit path, including the one
+    /// an exception takes.
+    ///
+    /// Without this the engine deadlocks when an operator throws, in two
+    /// separate places:
+    ///
+    ///   1. the fan-in sink counts one `EndOfChannel` per channel before it
+    ///      exits, so a channel that never announces itself leaves the sink
+    ///      waiting forever -- and `WorkerGroup`'s destructor then joins that
+    ///      thread;
+    ///   2. the source keeps pushing into the dead subtask's input queue until
+    ///      it fills, and then blocks in `push` forever.
+    ///
+    /// Both are the same mistake as a hand-written `join()` on the happy path
+    /// only (D-046): cleanup that is written as a statement rather than as a
+    /// destructor is cleanup that the exception path skips.
+    ///
+    /// The input queue is closed *first* so the source unblocks promptly rather
+    /// than waiting on the downstream announcement.
+    class SubtaskExitGuard {
+    public:
+        SubtaskExitGuard(BoundedQueue<StreamElement<In>>& input,
+                         QueueCollector<Out>& collector) noexcept
+            : input_(&input), collector_(&collector) {}
+
+        ~SubtaskExitGuard() {
+            input_->close();
+            collector_->close_channel();
+        }
+
+        SubtaskExitGuard(const SubtaskExitGuard&) = delete;
+        SubtaskExitGuard& operator=(const SubtaskExitGuard&) = delete;
+        SubtaskExitGuard(SubtaskExitGuard&&) = delete;
+        SubtaskExitGuard& operator=(SubtaskExitGuard&&) = delete;
+
+    private:
+        BoundedQueue<StreamElement<In>>* input_;
+        QueueCollector<Out>* collector_;
+    };
+
     // -----------------------------------------------------------------------
     // Subtask
     // -----------------------------------------------------------------------
@@ -351,6 +408,7 @@ private:
                             StateBackend& backend, std::size_t& record_count,
                             CheckpointCoordinator* coordinator) {
         QueueCollector<Out> collector(output, index);
+        const SubtaskExitGuard guard(input, collector);
 
         while (std::optional<StreamElement<In>> element = input.pop()) {
             std::visit(
@@ -370,8 +428,6 @@ private:
                 },
                 std::move(element->payload));
         }
-
-        collector.close_channel();
     }
 
     /// The heart of the algorithm, from one task's point of view.
@@ -435,12 +491,33 @@ private:
     // -----------------------------------------------------------------------
     class SinkTask {
     public:
+        class QueueCloser {
+        public:
+            explicit QueueCloser(BoundedQueue<StreamElement<Out>>& queue) noexcept
+                : queue_(&queue) {}
+
+            ~QueueCloser() { queue_->close(); }
+
+            QueueCloser(const QueueCloser&) = delete;
+            QueueCloser& operator=(const QueueCloser&) = delete;
+            QueueCloser(QueueCloser&&) = delete;
+            QueueCloser& operator=(QueueCloser&&) = delete;
+
+        private:
+            BoundedQueue<StreamElement<Out>>* queue_;
+        };
+
         SinkTask(std::size_t channels, TaskId task_id, CheckpointCoordinator* coordinator)
             : channels_(channels), task_id_(task_id), coordinator_(coordinator), tracker_(channels),
               barrier_seen_(channels, false), channel_closed_(channels, false), buffered_(channels),
               open_channels_(channels) {}
 
         void run(BoundedQueue<StreamElement<Out>>& queue, Sink<Out>& sink) {
+            // Closing on every exit path, for the mirror-image reason: a sink
+            // that throws would otherwise leave every subtask blocked pushing
+            // into a queue nobody drains.
+            const QueueCloser closer(queue);
+
             while (true) {
                 std::optional<StreamElement<Out>> element = next(queue);
                 if (!element.has_value()) {
@@ -481,7 +558,6 @@ private:
                     break;
                 }
             }
-            queue.close();
         }
 
         [[nodiscard]] std::size_t buffered_count() const noexcept { return buffered_count_; }

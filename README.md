@@ -5,7 +5,7 @@ actually works — event time and watermarks, windowing, keyed state,
 multi-threaded parallelism with backpressure, Chandy-Lamport checkpointing, and
 exactly-once recovery.
 
-Roughly 9,300 lines. 146 tests, every one of them green under ThreadSanitizer,
+Roughly 9,800 lines. 155 tests, every one of them green under ThreadSanitizer,
 AddressSanitizer, UndefinedBehaviorSanitizer, Clang and GCC.
 
 ---
@@ -198,6 +198,7 @@ applied five times and found something every time.
 | Disabled state restore, kept the rewind | Final totals came out **9 where the answer was 24** — exactly the pre-cut records dropped. |
 | Off-by-one in the key-group range | Exhaustive property tests caught it immediately; the **end-to-end rescale tests passed anyway**, because five keys only sample five of 128 groups. |
 | Ran the demo application | Found a genuine latent bug: `WindowOperator` inherited a no-op `snapshot_state`, so **windowed jobs checkpointed nothing**. Nothing crashed — recovery restarted every partially-filled window from empty and produced totals that were plausible and quietly short. |
+| Made an operator throw mid-run | **Deadlocked.** End-of-channel was announced as the last statement of a function, so the exception path skipped it and the fan-in sink waited forever; behind that, the source blocked on a queue nobody would drain. Fixed with RAII — the same rule the project already applied to threads, applied to channels. |
 
 Two conclusions worth stating plainly, because they generalise:
 
@@ -213,7 +214,7 @@ thorough.
 
 ### What is actually verified
 
-- **146 tests**, green under `dev` (Clang), `dev-gcc`, `asan` (ASan+UBSan) and
+- **155 tests**, green under `dev` (Clang), `dev-gcc`, `asan` (ASan+UBSan) and
   `tsan`. Sanitizer builds use `-O1` with assertions live and
   `-fno-sanitize-recover=all`, so UBSan aborts rather than logging.
 - **Concurrency** — the bounded queue and shutdown path are tested with genuine
@@ -228,7 +229,13 @@ thorough.
   an uninterrupted run every time. Covers failure before any checkpoint completes,
   immediately after one, and repeated failures.
 - **Property tests** — the key-group mapping is checked exhaustively over every
-  (parallelism, subtask, group) triple.
+  (parallelism, subtask, group) triple. Windowing is checked over seeded random
+  streams for conservation (every record is windowed exactly once or reported
+  late), agreement with a direct grouping, invariance under shuffled arrival
+  order, and full state release.
+- **Failure paths** — an operator or sink that throws must shut the pipeline down
+  rather than hang, and the failure must be *reported*, so an incomplete run
+  cannot be mistaken for a clean one.
 
 ---
 
@@ -331,6 +338,11 @@ snapshot path — and why it was missed.
 abstraction cost both point at the same thing: one record per handoff is the wrong
 granularity. Records should move in batches with a single lock acquisition.
 
+**Test the failure paths from the start.** No test ever made an operator throw,
+so a deadlock sat in the engine through four stages of "TSan-clean" claims. TSan
+finds races; it does not find missing cleanup on an exception path. That needed a
+test that deliberately fails.
+
 **Build the benchmark harness with the same scepticism as the engine.** Three
 separate measurement bugs produced confident, wrong numbers — pacing finer than
 the scheduler can honour, timing from the wrong clock origin, and mismatching the
@@ -349,7 +361,7 @@ include/ripple/        the engine, mostly headers
   checkpoint/          coordinator
   sinks/               idempotent sink
 src/                   non-template definitions
-tests/                 146 tests across 14 targets
+tests/                 155 tests across 16 targets
 benchmarks/            Google Benchmark components + end-to-end harness
 apps/                  the taxi demo
 docs/DESIGN.md         72 decisions, each with its rejected alternatives
