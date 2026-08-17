@@ -1,16 +1,21 @@
 #pragma once
 
+#include <ripple/checkpoint/checkpoint_coordinator.hpp>
 #include <ripple/collector.hpp>
 #include <ripple/concurrent/bounded_queue.hpp>
 #include <ripple/concurrent/worker_group.hpp>
 #include <ripple/operator.hpp>
 #include <ripple/parallel/stream_element.hpp>
 #include <ripple/record.hpp>
+#include <ripple/serialization.hpp>
 #include <ripple/sink.hpp>
 #include <ripple/state/memory_state_backend.hpp>
+#include <ripple/state/state_backend.hpp>
 #include <ripple/watermark.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -26,19 +31,17 @@ namespace ripple {
 /// Pushes an operator's output into a queue instead of calling the next operator
 /// directly.
 ///
-/// ## This is the payoff of D-014
+/// ## The payoff of D-014
 ///
-/// `Collector<T>` was defined in Stage 1 as an *interface* specifically so this
-/// could exist. Every operator -- map, filter, window, keyed aggregate -- was
-/// written against `Collector<T>&` and calls `out.collect(...)` exactly as
-/// before. **Not one line of operator code changed to make the engine parallel.**
-/// Had the Stage 1 chain been welded together with CRTP, there would be no seam
-/// here to insert a queue into.
+/// `Collector<T>` was defined in Stage 1 as an *interface* precisely so this
+/// could exist. Swapping it in made the engine parallel and **not one line of
+/// operator code changed** -- map, filter, window and keyed aggregate are all
+/// still written against `Collector<T>&` and still just call `out.collect(...)`.
+/// A compile-time welded chain (the CRTP design rejected in D-014) would have no
+/// seam here at all.
 ///
-/// `collect` blocks when the queue is full, and that blocking *is* the
-/// backpressure: a subtask that cannot hand its output on stops consuming its
-/// own input, so its input queue fills, and the pressure propagates upstream on
-/// its own.
+/// `collect` blocking on a full queue *is* the backpressure. Nothing in this
+/// design signals, measures, or negotiates.
 template<typename T>
 class QueueCollector final : public Collector<T> {
 public:
@@ -46,18 +49,19 @@ public:
         : queue_(&queue), channel_(channel) {}
 
     void collect(Record<T>&& record) override {
-        // Blocks while the downstream queue is full. Nothing here signals,
-        // measures, or negotiates -- the block is the entire mechanism.
-        (void)queue_->push(StreamElement<T>{std::move(record)});
+        (void)queue_->push(StreamElement<T>{channel_, std::move(record)});
     }
 
     void emit_watermark(Watermark watermark) override {
-        (void)queue_->push(StreamElement<T>{ChannelWatermark{channel_, watermark}});
+        (void)queue_->push(StreamElement<T>{channel_, watermark});
     }
 
-    /// Announces that this channel is finished. See `ChannelClosed` for why a
-    /// fan-in queue cannot simply be closed by whichever producer finishes first.
-    void close_channel() { (void)queue_->push(StreamElement<T>{ChannelClosed{channel_}}); }
+    /// Forwards a checkpoint barrier downstream, in line with the records.
+    void emit_barrier(CheckpointBarrier barrier) {
+        (void)queue_->push(StreamElement<T>{channel_, barrier});
+    }
+
+    void close_channel() { (void)queue_->push(StreamElement<T>{channel_, EndOfChannel{}}); }
 
 private:
     BoundedQueue<StreamElement<T>>* queue_;
@@ -67,29 +71,29 @@ private:
 struct ParallelConfig {
     std::size_t parallelism = 4;
 
-    /// Deliberately small by default. A large capacity delays the onset of
-    /// backpressure and hides a slow stage behind a deep buffer; it does not
-    /// make the pipeline faster, it makes the problem later and less visible.
+    /// Deliberately small. A large capacity delays the onset of backpressure and
+    /// hides a slow stage behind a deep buffer; it does not make the pipeline
+    /// faster, only the problem later and less visible.
     std::size_t queue_capacity = 64;
+
+    /// Inject a checkpoint barrier every N source records. Zero disables
+    /// checkpointing entirely.
+    std::size_t checkpoint_interval_records = 0;
 };
 
-/// What each queue and subtask actually did. The point of instrumenting this is
-/// that backpressure and key skew are otherwise invisible -- the job simply runs
-/// slower than expected with nothing obviously wrong.
 struct ParallelMetrics {
     /// Records handled by each subtask. Wildly uneven entries mean **key skew**:
-    /// hash partitioning sends every record for a given key to one subtask, so a
-    /// single hot key caps the whole job at one core's throughput no matter how
-    /// much parallelism is configured. Adding threads cannot fix it; only
-    /// changing the key can.
+    /// hash partitioning sends every record for a key to one subtask, so a single
+    /// hot key caps the job at one core's throughput. Adding threads cannot fix
+    /// it; only changing the key can.
     std::vector<std::size_t> records_per_subtask;
-
-    /// How often the source blocked pushing into each subtask's input queue.
     std::vector<std::size_t> input_queue_push_blocks;
-
-    /// How often a subtask blocked pushing into the sink's queue. A high value
-    /// here with low values above localises the slow stage as the sink.
     std::size_t sink_queue_push_blocks = 0;
+
+    /// How many elements the sink set aside while waiting for a barrier to
+    /// arrive on every channel. This is the **cost of alignment** made visible: a
+    /// large number means one subtask is lagging and the rest are stalled on it.
+    std::size_t alignment_buffered_elements = 0;
 
     [[nodiscard]] std::size_t total_input_push_blocks() const {
         std::size_t total = 0;
@@ -100,48 +104,33 @@ struct ParallelMetrics {
     }
 };
 
-/// Runs one operator across several threads, partitioned by key.
+/// Runs one operator across several threads, partitioned by key, with optional
+/// asynchronous barrier snapshotting.
 ///
-/// Topology:
 /// ```
-///   source (calling thread)
+///   source (calling thread)   -- injects barriers, broadcast
 ///        |  partition by hash(key) % parallelism
 ///        v
 ///   [q0] [q1] ... [qN-1]          bounded
 ///     |    |        |
 ///   sub0 sub1 ... subN-1          own operator + own state backend each
 ///     \    |        /
-///      \   |       /  fan-in
-///       [ sink queue ]            bounded
+///      \   |       /  fan-in -- the only multi-input operator, so the only
+///       [ sink queue ]            place alignment happens
 ///             |
 ///          sink thread
 /// ```
-///
-/// The source runs on the calling thread on purpose: when the pipeline is
-/// saturated, `run()` itself blocks, which is backpressure reaching the caller.
-///
-/// Deliberately not a general DAG runner. The shape above exercises everything
-/// this stage is about -- partitioned fan-out, fan-in with watermark merging,
-/// and backpressure across two queue layers -- without an arbitrary-topology
-/// scheduler that would be mostly bookkeeping.
 template<typename In, typename Out, typename KeyHash, typename OperatorFactory>
 class ParallelPipeline {
 public:
-    /// `key_hash` maps a payload to a hash. `make_operator(index, backend)`
-    /// builds one operator per subtask.
-    ///
-    /// Each subtask gets its **own** operator instance and its **own** state
-    /// backend. That is what makes keyed state lock-free (D-038): partitioning
-    /// guarantees one subtask per key, so no two threads ever touch the same
-    /// state and there is nothing to protect. Sharing one backend behind a mutex
-    /// would not merely be slower, it would fail to scale -- contention grows
-    /// with thread count.
     ParallelPipeline(ParallelConfig config, KeyHash key_hash, OperatorFactory make_operator)
         : config_(config), key_hash_(std::move(key_hash)),
           make_operator_(std::move(make_operator)) {}
 
-    /// Runs to completion, then returns. Blocks the calling thread.
-    void run(std::vector<Record<In>> input, Sink<Out>& sink) {
+    /// Runs to completion. If `coordinator` is non-null it must have been
+    /// constructed with `parallelism + 1` tasks -- one per subtask, plus the sink.
+    void run(std::vector<Record<In>> input, Sink<Out>& sink,
+             CheckpointCoordinator* coordinator = nullptr) {
         const std::size_t parallelism = config_.parallelism;
 
         std::vector<std::unique_ptr<BoundedQueue<StreamElement<In>>>> input_queues;
@@ -149,11 +138,9 @@ public:
         for (std::size_t i = 0; i < parallelism; ++i) {
             // One heap allocation per queue, so each queue's mutex and counters
             // sit on their own cache lines rather than sharing one with a
-            // neighbouring queue's. Two subtasks hammering adjacent mutexes on a
-            // single line would ping-pong that line between cores -- false
-            // sharing, which looks like contention on data the threads never
-            // actually share. Whether padding *within* the queue matters is a
-            // Stage 9 measurement, not a guess to make here.
+            // neighbour's. Two subtasks hammering adjacent mutexes on a single
+            // line would ping-pong it between cores -- false sharing, which looks
+            // like contention on data the threads never actually share.
             input_queues.push_back(
                 std::make_unique<BoundedQueue<StreamElement<In>>>(config_.queue_capacity));
         }
@@ -170,122 +157,311 @@ public:
         }
 
         std::vector<std::size_t> records_per_subtask(parallelism, 0);
+        SinkTask sink_task(parallelism, parallelism, coordinator);
 
         {
             WorkerGroup workers;
 
             for (std::size_t i = 0; i < parallelism; ++i) {
                 workers.spawn("subtask-" + std::to_string(i), [&, i](const std::stop_token&) {
-                    run_subtask(i, *input_queues[i], sink_queue, *operators[i],
-                                records_per_subtask[i]);
+                    run_subtask(i, *input_queues[i], sink_queue, *operators[i], *backends[i],
+                                records_per_subtask[i], coordinator);
                 });
             }
 
-            workers.spawn("sink",
-                          [&](const std::stop_token&) { run_sink(parallelism, sink_queue, sink); });
+            workers.spawn("sink", [&](const std::stop_token&) { sink_task.run(sink_queue, sink); });
 
-            // --- source, on the calling thread ---------------------------
+            // --- source, on the calling thread -------------------------------
+            std::size_t offset = 0;
             for (Record<In>& record : input) {
                 const std::size_t partition = key_hash_(record.value) % parallelism;
-                (void)input_queues[partition]->push(StreamElement<In>{std::move(record)});
+                (void)input_queues[partition]->push(StreamElement<In>{0, std::move(record)});
+                ++offset;
+
+                if (config_.checkpoint_interval_records > 0 && coordinator != nullptr &&
+                    offset % config_.checkpoint_interval_records == 0) {
+                    // The source records its own position *before* the barrier
+                    // enters the stream, so the checkpoint's offset and every
+                    // snapshot downstream describe the same cut.
+                    const CheckpointId id = coordinator->trigger(offset);
+
+                    // Broadcast, not partitioned -- exactly like a watermark. A
+                    // barrier is an instruction to every task; routing it to one
+                    // subtask would leave the others never snapshotting, and the
+                    // checkpoint could never complete.
+                    for (auto& queue : input_queues) {
+                        (void)queue->push(StreamElement<In>{0, CheckpointBarrier{id}});
+                    }
+                }
             }
 
-            // Broadcast, not partitioned. A watermark is a statement about time
-            // and applies to every subtask; routing it to one would leave the
-            // others frozen in event time, so their windows would never fire.
             for (auto& queue : input_queues) {
-                (void)queue->push(StreamElement<In>{ChannelWatermark{0, kEndOfStreamWatermark}});
+                (void)queue->push(StreamElement<In>{0, kEndOfStreamWatermark});
             }
 
-            // Shutdown, in the order D-045 requires: close the queues first, so
-            // blocked workers wake, and only then let WorkerGroup's destructor
-            // stop and join. Reversing it hangs.
-            //
-            // Closing is sufficient on the *input* side because each of these
-            // queues has exactly one producer -- this thread. The sink queue has
-            // N producers and must instead be terminated by counting
-            // ChannelClosed elements.
+            // Shutdown in the order D-045 requires: close the queues so blocked
+            // workers wake, then let WorkerGroup's destructor stop and join.
+            // Closing suffices here because each input queue has exactly one
+            // producer -- this thread. The sink queue has N and is instead
+            // terminated by counting EndOfChannel elements.
             for (auto& queue : input_queues) {
                 queue->close();
             }
         } // workers joined here
 
-        // Only now. `records_per_subtask` is written by the subtask threads, so
-        // reading it before the join above would be a data race -- and the queue
-        // counters would be a mid-flight snapshot rather than the final totals.
-        collect_metrics(input_queues, sink_queue, records_per_subtask);
+        collect_metrics(input_queues, sink_queue, records_per_subtask, sink_task);
     }
 
     [[nodiscard]] const ParallelMetrics& metrics() const noexcept { return metrics_; }
 
 private:
+    // -----------------------------------------------------------------------
+    // Subtask
+    // -----------------------------------------------------------------------
     static void run_subtask(std::size_t index, BoundedQueue<StreamElement<In>>& input,
                             BoundedQueue<StreamElement<Out>>& output, Operator<In, Out>& op,
-                            std::size_t& record_count) {
+                            StateBackend& backend, std::size_t& record_count,
+                            CheckpointCoordinator* coordinator) {
         QueueCollector<Out> collector(output, index);
 
         while (std::optional<StreamElement<In>> element = input.pop()) {
             std::visit(
-                [&](auto&& alternative) {
-                    using Alternative = std::decay_t<decltype(alternative)>;
-                    if constexpr (std::is_same_v<Alternative, Record<In>>) {
+                [&](auto&& payload) {
+                    using Payload = std::decay_t<decltype(payload)>;
+                    if constexpr (std::is_same_v<Payload, Record<In>>) {
                         ++record_count;
-                        op.process(std::forward<decltype(alternative)>(alternative), collector);
-                    } else if constexpr (std::is_same_v<Alternative, ChannelWatermark>) {
-                        op.on_watermark(alternative.watermark, collector);
+                        op.process(std::forward<decltype(payload)>(payload), collector);
+                    } else if constexpr (std::is_same_v<Payload, Watermark>) {
+                        op.on_watermark(payload, collector);
+                    } else if constexpr (std::is_same_v<Payload, CheckpointBarrier>) {
+                        snapshot_and_acknowledge(payload, index, op, backend, collector,
+                                                 coordinator);
                     }
-                    // ChannelClosed is unused on the input side: these queues
-                    // have a single producer and are terminated by close().
+                    // EndOfChannel is unused on the input side: these queues have
+                    // a single producer and are terminated by close().
                 },
-                std::move(*element));
+                std::move(element->payload));
         }
 
-        // Tell the fan-in consumer this channel is finished. Skipping this
-        // leaves the sink waiting forever for a count it will never reach.
         collector.close_channel();
     }
 
-    static void run_sink(std::size_t parallelism, BoundedQueue<StreamElement<Out>>& queue,
-                         Sink<Out>& sink) {
-        // The fan-in point, and the only place the min-across-channels rule from
-        // Stage 2 actually bites. Each subtask advances in event time
-        // independently; the sink may claim only as much progress as its
-        // *slowest* input has made.
-        WatermarkTracker tracker(parallelism);
-        std::size_t open_channels = parallelism;
+    /// The heart of the algorithm, from one task's point of view.
+    ///
+    /// The barrier arrived **in line with the records**, so every record before
+    /// it has already been processed by this task and none after it has. That is
+    /// the whole trick: this task's state right now reflects exactly the prefix
+    /// of the stream ahead of the barrier, and every other task independently
+    /// reaches the same conclusion about its own prefix. Add the snapshots up and
+    /// they describe one consistent cut -- with nobody ever having stopped.
+    ///
+    /// ## Snapshotting without stopping the world
+    ///
+    /// This serializes synchronously, on the task's own thread, with **no lock at
+    /// all**. Not a shortcut: partitioning (D-050) means no other thread can
+    /// touch this task's state, so there is nothing to exclude. The only cost is
+    /// that this one subtask stalls while serializing; every other subtask keeps
+    /// running and no global pause ever occurs.
+    ///
+    /// Rejected alternatives, which start to matter once state is large enough
+    /// for the stall to show:
+    ///   - **Brief locking** -- take a lock, serialize, release. Pointless here:
+    ///     there is no second thread to lock against.
+    ///   - **Double-buffering** -- keep two copies, swap, serialize the inactive
+    ///     one on a background thread. Removes the stall by *doubling*
+    ///     steady-state memory, which for a keyed job with large state is the
+    ///     dominant cost.
+    ///   - **Copy-on-write** -- snapshot logically and pay only for state mutated
+    ///     during the snapshot. Best asymptotics, by far the most complex: with
+    ///     no OS page-level support it means a persistent data structure for every
+    ///     state type, pushing a heavy constraint into `StateBackend` for a stall
+    ///     nobody has measured.
+    ///
+    /// Synchronous serialization is the right default at the state sizes this
+    /// engine handles. Stage 9 is where a benchmark would say otherwise.
+    static void snapshot_and_acknowledge(CheckpointBarrier barrier, TaskId task,
+                                         const Operator<In, Out>& op, const StateBackend& backend,
+                                         QueueCollector<Out>& collector,
+                                         CheckpointCoordinator* coordinator) {
+        // Forward first, snapshot second.
+        //
+        // The cut is identical either way -- no record is processed in between --
+        // but forwarding first lets downstream begin aligning while this task is
+        // still serializing, which keeps end-to-end checkpoint duration close to
+        // the *slowest single task* rather than the sum of all of them. This is
+        // what real engines do.
+        collector.emit_barrier(barrier);
 
-        while (std::optional<StreamElement<Out>> element = queue.pop()) {
+        if (coordinator == nullptr) {
+            return;
+        }
+
+        ByteWriter writer;
+        backend.write_snapshot(writer);
+        op.snapshot_state(writer);
+        coordinator->acknowledge(barrier.checkpoint_id, task, std::move(writer).take());
+    }
+
+    // -----------------------------------------------------------------------
+    // Sink -- the only multi-input operator, so the only place alignment happens
+    // -----------------------------------------------------------------------
+    class SinkTask {
+    public:
+        SinkTask(std::size_t channels, TaskId task_id, CheckpointCoordinator* coordinator)
+            : channels_(channels), task_id_(task_id), coordinator_(coordinator), tracker_(channels),
+              barrier_seen_(channels, false), channel_closed_(channels, false), buffered_(channels),
+              open_channels_(channels) {}
+
+        void run(BoundedQueue<StreamElement<Out>>& queue, Sink<Out>& sink) {
+            while (true) {
+                std::optional<StreamElement<Out>> element = next(queue);
+                if (!element.has_value()) {
+                    break;
+                }
+
+                const std::size_t channel = element->channel;
+
+                // ## Barrier alignment
+                //
+                // Once a channel has delivered barrier N, everything after it on
+                // that channel belongs *after* the cut and must not touch the
+                // state being snapshotted. So it is set aside and replayed once
+                // every channel has caught up.
+                //
+                // **What alignment buys**: the snapshot reflects exactly the
+                // pre-barrier prefix of every input. Skip it, process the fast
+                // channel's post-barrier records, and those records are baked into
+                // the snapshot *and* replayed after recovery -- counted twice.
+                // That is exactly the difference between aligned (exactly-once)
+                // and unaligned (at-least-once) checkpointing.
+                //
+                // **What it costs**: latency. The operator waits for its slowest
+                // input.
+                //
+                // Flink instead stops *reading* the channel, which backpressures
+                // the sender. Buffering here produces the identical cut, and
+                // therefore identical semantics, trading that backpressure for
+                // memory held during alignment. `alignment_buffered_elements`
+                // exists so the trade is visible rather than assumed.
+                if (aligning_.has_value() && barrier_seen_[channel]) {
+                    ++buffered_count_;
+                    buffered_[channel].push_back(std::move(*element));
+                    continue;
+                }
+
+                if (dispatch(std::move(*element), channel, sink)) {
+                    break;
+                }
+            }
+            queue.close();
+        }
+
+        [[nodiscard]] std::size_t buffered_count() const noexcept { return buffered_count_; }
+
+    private:
+        std::optional<StreamElement<Out>> next(BoundedQueue<StreamElement<Out>>& queue) {
+            // Replayed elements first: they arrived before anything still sitting
+            // in the queue and must keep their place in the stream.
+            if (!pending_.empty()) {
+                StreamElement<Out> element = std::move(pending_.front());
+                pending_.pop_front();
+                return element;
+            }
+            return queue.pop();
+        }
+
+        /// Returns true when the stream is over.
+        // The payload is moved out of `element`; the check does not track moves
+        // of subobjects.
+        // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
+        bool dispatch(StreamElement<Out>&& element, std::size_t channel, Sink<Out>& sink) {
             bool finished = false;
             std::visit(
-                [&](auto&& alternative) {
-                    using Alternative = std::decay_t<decltype(alternative)>;
-                    if constexpr (std::is_same_v<Alternative, Record<Out>>) {
-                        // Only this one thread ever touches the sink, which is
-                        // why no lock is needed around it.
-                        sink.write(std::forward<decltype(alternative)>(alternative));
-                    } else if constexpr (std::is_same_v<Alternative, ChannelWatermark>) {
+                [&](auto&& payload) {
+                    using Payload = std::decay_t<decltype(payload)>;
+                    if constexpr (std::is_same_v<Payload, Record<Out>>) {
+                        // Only this thread ever touches the sink, hence no lock.
+                        ++records_written_;
+                        sink.write(std::forward<decltype(payload)>(payload));
+                    } else if constexpr (std::is_same_v<Payload, Watermark>) {
                         if (const std::optional<Watermark> combined =
-                                tracker.update(alternative.channel, alternative.watermark)) {
+                                tracker_.update(channel, payload)) {
                             sink.on_watermark(*combined);
                         }
+                    } else if constexpr (std::is_same_v<Payload, CheckpointBarrier>) {
+                        on_barrier(payload, channel);
                     } else {
-                        --open_channels;
-                        finished = open_channels == 0;
+                        channel_closed_[channel] = true;
+                        --open_channels_;
+                        // A channel that will never send another barrier must not
+                        // hold alignment open forever.
+                        if (aligning_.has_value()) {
+                            complete_alignment_if_ready();
+                        }
+                        finished = open_channels_ == 0;
                     }
                 },
-                std::move(*element));
+                std::move(element.payload));
+            return finished;
+        }
 
-            if (finished) {
-                break;
+        void on_barrier(CheckpointBarrier barrier, std::size_t channel) {
+            if (!aligning_.has_value()) {
+                aligning_ = barrier.checkpoint_id;
+                std::fill(barrier_seen_.begin(), barrier_seen_.end(), false);
+            }
+            barrier_seen_[channel] = true;
+            complete_alignment_if_ready();
+        }
+
+        void complete_alignment_if_ready() {
+            if (!aligning_.has_value()) {
+                return;
+            }
+            for (std::size_t channel = 0; channel < channels_; ++channel) {
+                if (!barrier_seen_[channel] && !channel_closed_[channel]) {
+                    return;
+                }
+            }
+
+            // Every input has reached the barrier, so this sink's state now
+            // reflects exactly the pre-barrier prefix of every channel.
+            if (coordinator_ != nullptr) {
+                ByteWriter writer;
+                Serializer<std::size_t>::write(writer, records_written_);
+                coordinator_->acknowledge(*aligning_, task_id_, std::move(writer).take());
+            }
+            aligning_.reset();
+
+            // Replay what was set aside; those elements belong to the next epoch.
+            for (std::deque<StreamElement<Out>>& channel_buffer : buffered_) {
+                for (StreamElement<Out>& element : channel_buffer) {
+                    pending_.push_back(std::move(element));
+                }
+                channel_buffer.clear();
             }
         }
-        queue.close();
-    }
+
+        std::size_t channels_;
+        TaskId task_id_;
+        CheckpointCoordinator* coordinator_;
+        WatermarkTracker tracker_;
+
+        std::optional<CheckpointId> aligning_;
+        std::vector<bool> barrier_seen_;
+        std::vector<bool> channel_closed_;
+        std::vector<std::deque<StreamElement<Out>>> buffered_;
+        std::deque<StreamElement<Out>> pending_;
+
+        std::size_t open_channels_;
+        std::size_t records_written_ = 0;
+        std::size_t buffered_count_ = 0;
+    };
 
     void collect_metrics(
         const std::vector<std::unique_ptr<BoundedQueue<StreamElement<In>>>>& input_queues,
         const BoundedQueue<StreamElement<Out>>& sink_queue,
-        const std::vector<std::size_t>& records_per_subtask) {
+        const std::vector<std::size_t>& records_per_subtask, const SinkTask& sink_task) {
         metrics_.input_queue_push_blocks.clear();
         metrics_.input_queue_push_blocks.reserve(input_queues.size());
         for (const auto& queue : input_queues) {
@@ -293,6 +469,7 @@ private:
         }
         metrics_.sink_queue_push_blocks = sink_queue.push_block_count();
         metrics_.records_per_subtask = records_per_subtask;
+        metrics_.alignment_buffered_elements = sink_task.buffered_count();
     }
 
     ParallelConfig config_;

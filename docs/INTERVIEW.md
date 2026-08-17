@@ -467,6 +467,78 @@ than no check.
 
 ---
 
+## Stage 7 — Checkpointing (Chandy-Lamport asynchronous barrier snapshotting)
+
+**This is the stage an interviewer will dig into. Be able to derive it from
+scratch, not recite it.**
+
+### The algorithm in one paragraph
+
+The source injects a barrier into the stream. It flows through the same queues as
+the records, in order. Because a barrier cannot overtake the records ahead of it,
+a task receiving barrier N knows every record before it has already been
+processed *by that task* and none after it has -- so its state reflects exactly
+the prefix ahead of the barrier. Every task independently reaches the same
+conclusion about its own prefix. Add the snapshots together and they describe one
+consistent cut, taken at different wall-clock moments, with nobody ever having
+stopped.
+
+### Concepts covered
+
+- **Why stop-the-world snapshots do not scale**, and why in-band barriers do.
+- **Barriers are broadcast, not partitioned** — same reason as watermarks.
+- **Why a checkpoint is unusable until every task acknowledges**, and why a late
+  acknowledgement must be ignored rather than applied.
+- **Why the source offset lives in the checkpoint** alongside the state.
+- **Barrier alignment**: what it buys (exactly-once), what it costs (latency),
+  and why only multi-input operators need it.
+- **Aligned vs unaligned checkpointing** — the concrete double-count.
+- **Snapshotting without a global pause**, and the memory implications of brief
+  locking vs double-buffering vs copy-on-write.
+- **Forward-then-snapshot** and why it shortens end-to-end checkpoint duration.
+
+### The demonstration worth describing in an interview
+
+Alignment was **verified by removing it**. With the alignment branch disabled,
+the sink snapshotted 32 records at a cut where the source had emitted 20 — twelve
+post-cut records baked into the checkpoint, which on recovery would be replayed
+*and* already present in the restored state. Counted twice.
+
+That is the aligned/unaligned distinction as a number rather than a claim, and it
+is the third time this project has used the same technique: break the property
+deliberately, confirm the check fails, restore. (See also the recovering-UBSan
+lesson in Stage 0 and the TSan-contention finding in Stage 5.)
+
+### Questions to be able to answer cold
+
+1. Derive the algorithm. Why does a barrier travelling *with* the data give you a
+   consistent snapshot without pausing anything?
+2. Why not just pause every task, snapshot, and resume? Be specific about what
+   goes wrong and how it scales.
+3. What exactly does barrier alignment buy you? Give the concrete failure without
+   it.
+4. Which operators need alignment and which do not? Why?
+5. What is the difference between aligned and unaligned checkpointing, in terms
+   of the guarantee each provides?
+6. Why is a checkpoint useless until every single task acknowledges?
+7. Why must a late acknowledgement for a completed checkpoint be discarded?
+8. Why does the checkpoint store the source's read offset?
+9. How do you snapshot state without stopping the world? Compare brief locking,
+   double-buffering and copy-on-write, including memory cost.
+10. Should a task forward the barrier before or after snapshotting? Does it
+    change correctness? Does it change anything else?
+11. Your checkpoints complete but recovery produces wrong results. Where do you
+    look first?
+
+### Struggled with — revision list
+
+- **Unverified** — built without the comprehension gate. **Every question here is
+  high-value.** This is the part of the project most worth being able to explain
+  from first principles, and questions 1, 3, 5 and 9 are the ones most likely to
+  be asked directly.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

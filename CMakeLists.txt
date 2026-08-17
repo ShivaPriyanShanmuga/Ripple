@@ -128,6 +128,7 @@ endif()
 add_library(ripple STATIC
     src/pipeline.cpp
     src/file_state_backend.cpp
+    src/checkpoint_coordinator.cpp
 )
 add_library(ripple::ripple ALIAS ripple)
 

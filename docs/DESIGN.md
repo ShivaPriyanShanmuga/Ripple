@@ -1161,6 +1161,141 @@ the pipeline outlives the read.
 
 ---
 
+### D-054 — Chandy-Lamport: barriers travel with the data
+
+**Chosen:** the source injects a `CheckpointBarrier` into the stream; it flows
+through the same queues as records, in order; each task snapshots when the
+barrier reaches it, acknowledges to the coordinator, and forwards it on.
+
+**Rejected — a stop-the-world pause.** Halt every task, snapshot, resume. It is
+simple and correct, and unusable: throughput drops to zero for the duration, and
+it gets *worse* with more tasks because you wait for the slowest every time. At a
+checkpoint every few seconds a job could spend a third of its life paused.
+
+**Why in-band works.** A barrier cannot overtake the records ahead of it, so a
+task receiving barrier N knows every record before it has already been processed
+**by that task** and none after it has. Its state therefore reflects exactly the
+prefix of the stream ahead of the barrier -- and every other task independently
+reaches the same conclusion about its own prefix. Add the snapshots together and
+they describe one consistent cut, with nobody ever having stopped. That is the
+whole algorithm, and it is the same ordering property that makes watermarks work
+(D-021).
+
+**Barriers are broadcast, not partitioned** -- like watermarks, for the same
+reason. A barrier is an instruction to every task; routing it to one subtask by
+key would leave the others never snapshotting, so the checkpoint could never
+complete.
+
+---
+
+### D-055 — A checkpoint is unusable until every task acknowledges
+
+The coordinator holds a checkpoint in `pending_` until it has one snapshot per
+task, and only then does it become visible through `latest_completed()`.
+
+A partial checkpoint is not partially useful, it is **corrupt**. Restoring from a
+set where task 3 never reported would reset tasks 0-2 to the cut while task 3
+kept state from some later point -- the cut would not be a cut, and exactly-once
+would be silently untrue.
+
+For the same reason a late acknowledgement for an already-completed checkpoint is
+**ignored** rather than applied. Accepting a straggler would replace one task's
+snapshot with state from a different point, and the set would no longer describe
+any single cut.
+
+The `source_offset` lives in the same record as the task state because they are
+one atomic fact about the same cut. Restoring state without rewinding the source
+would skip every record in between.
+
+---
+
+### D-056 — Barrier alignment, and what it buys
+
+The sink is the only multi-input operator, so it is the only place alignment
+happens.
+
+When barrier N arrives on channel `c`, everything that follows on `c` belongs
+*after* the cut and must not touch the state being snapshotted. So the sink sets
+those elements aside and replays them once every channel has delivered its
+barrier.
+
+**What it buys:** the snapshot reflects exactly the pre-barrier prefix of every
+input. **What it costs:** latency -- the operator waits for its slowest input.
+
+That is precisely the aligned (exactly-once) versus unaligned (at-least-once)
+distinction, and it was **demonstrated rather than asserted**. Disabling the
+alignment branch and re-running produced:
+
+```
+checkpoint 1 snapshotted 32 records but the source was at offset 20
+checkpoint 2 snapshotted 50 records but the source was at offset 40
+```
+
+Twelve post-cut records baked into the first checkpoint. On recovery those would
+be replayed *and* already present in the restored state -- counted twice. Exactly
+the double-count alignment exists to prevent.
+
+Note that `BarriersDoNotOvertakeRecords` still passed with alignment disabled,
+which is correct: subtasks have a single input each and need no alignment. Only
+the fan-in operator does.
+
+**Implementation difference from Flink, stated honestly.** Flink stops *reading*
+the channel, which backpressures the sender. Ripple buffers in the consumer
+instead, because its fan-in is a single shared queue rather than one channel per
+upstream. The cut -- and therefore the semantics -- is identical; the trade is
+backpressure-during-alignment for memory-during-alignment.
+`ParallelMetrics::alignment_buffered_elements` exists so that cost is visible.
+
+---
+
+### D-057 — Snapshotting without stopping the world
+
+Each task serializes its own state **synchronously, on its own thread, with no
+lock at all**.
+
+That is not a shortcut. Partitioning (D-050) means no other thread can touch this
+task's state, so there is nothing to exclude. The only cost is that one subtask
+stalls while serializing; every other subtask keeps running and no global pause
+ever occurs.
+
+**Rejected — brief locking.** Take a lock, serialize, release. Pointless here:
+there is no second thread to lock against.
+
+**Rejected — double-buffering.** Keep two copies, swap, serialize the inactive
+one on a background thread. Removes the stall by *doubling* steady-state memory,
+which for a keyed job with large state is the dominant cost.
+
+**Rejected — copy-on-write.** Snapshot logically and pay only for state mutated
+during the snapshot. Best asymptotics and by far the most complex: with no OS
+page-level support it means a persistent data structure for every state type,
+pushing a heavy constraint into `StateBackend` for a stall nobody has measured.
+
+Synchronous serialization is the right default at these state sizes. Stage 9 is
+where a benchmark would say otherwise.
+
+---
+
+### D-058 — Forward the barrier before snapshotting
+
+The cut is identical either way -- no record is processed between the two -- but
+forwarding first lets downstream begin aligning while this task is still
+serializing. That keeps end-to-end checkpoint duration close to the **slowest
+single task** rather than the sum of all of them, and it is what real engines do.
+
+---
+
+### Caught by the two-compiler CI (D-006)
+
+`for (const std::string& zone : {"a", "b", "c", "d"})` binds the reference to a
+temporary `std::string` constructed on **every iteration**. Clang accepts it
+silently; GCC's `-Wrange-loop-construct` rejected it.
+
+Recorded because it is the first time the second frontend paid for itself, and it
+is exactly the class of thing D-006 predicted: a single compiler accepts
+sloppiness that is not obviously wrong until another one names it.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -1172,7 +1307,7 @@ the pipeline outlives the read.
 | 4 | Keyed state, backend, serialization | **Complete** — 84 tests, clean under dev/gcc/asan/tsan |
 | 5 | Concurrency primitives | **Complete** — 106 tests, TSan-clean under contention |
 | 6 | Parallelism, partitioning, backpressure | **Complete** — 115 tests, TSan-clean over repeated runs |
-| 7 | Checkpointing (Chandy-Lamport ABS) | Not started |
+| 7 | Checkpointing (Chandy-Lamport ABS) | **Complete** — 125 tests, alignment verified by disabling it |
 | 8 | Recovery and exactly-once | Not started |
 | 9 | Benchmarks and demo application | Not started |
 | 10 | README | Not started |
