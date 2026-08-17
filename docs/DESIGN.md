@@ -1023,6 +1023,144 @@ correct shutdown is the default rather than a discipline.
 
 ---
 
+### D-047 — `QueueCollector`: the Stage 1 seam pays off
+
+`Collector<T>` was defined in Stage 1 as an *interface* precisely so a
+queue-pushing implementation could replace the direct-call one. Swapping it in
+made the engine parallel and **not one line of operator code changed** -- map,
+filter, window and keyed-aggregate are all still written against
+`Collector<T>&` and still just call `out.collect(...)`.
+
+This is the concrete vindication of rejecting CRTP in D-014: a compile-time
+welded chain has no seam to insert a queue into. The cost paid there (one virtual
+call per record per operator) bought exactly this.
+
+`collect` blocking on a full queue *is* the backpressure. There is no signalling,
+no measurement, and no rate limiter anywhere in the design.
+
+---
+
+### D-048 — `StreamElement` is a variant, and only in the transport
+
+The queues carry `std::variant<Record<T>, ChannelWatermark, ChannelClosed>`.
+
+This is the case D-014 explicitly reserved variants for. Payload types are an
+**open** set defined by users, so a variant over them would be a central registry
+everyone must edit. Stream elements are the opposite: a **closed set fixed by the
+engine** -- data, time progress, end of channel. Stage 7 adds a fourth
+alternative for barriers and nothing else changes shape.
+
+**The layering matters.** The operator interface never sees this type: operators
+have `process` and `on_watermark` as separate virtuals (D-021), so map and filter
+still need no knowledge that watermarks exist. The variant lives only in the
+transport, because a queue must carry one concrete type. Interface shape and
+transport shape are separate decisions, and getting that wrong in either
+direction would have forced every operator to dispatch on an alternative it does
+not care about.
+
+---
+
+### D-049 — Fan-out closes queues; fan-in counts channels
+
+An asymmetry worth stating because it is not arbitrary.
+
+**Input queues (one producer, the source):** `close()` is sufficient. `pop()`
+returning `nullopt` means the stream is over.
+
+**The sink queue (N producers):** `close()` is *wrong* -- the first subtask to
+finish would close the queue out from under the others. End-of-stream must
+therefore travel **as an element** (`ChannelClosed{channel}`), and the consumer
+exits once it has counted one from every channel.
+
+`ChannelWatermark` carries its channel index for the same structural reason: a
+fan-in consumer must take the **minimum** across channels, and an untagged
+watermark would look like progress on every channel at once -- which is the
+"take the maximum" mistake that silently discards on-time data from slower
+channels.
+
+This is where `WatermarkTracker` (D-026, built in Stage 2 with nothing to consume
+it) finally does its job.
+
+---
+
+### D-050 — One state backend per subtask, not one shared behind a lock
+
+Each subtask gets its own operator instance **and its own `MemoryStateBackend`**.
+
+That is what makes keyed state lock-free rather than merely fast: hash
+partitioning guarantees one subtask per key, so no two threads ever touch the
+same state and there is nothing to protect. Sharing one backend behind a mutex
+would not simply run slower -- it would fail to scale, because contention grows
+with thread count. Partitioning removes the shared resource instead of guarding
+it.
+
+The property is asserted rather than assumed:
+`RoutesEveryRecordForAKeyToTheSameSubtask` checks each key's final running total,
+which can only be correct if every one of that key's records was accumulated in
+one place. Split a key across subtasks and each keeps a partial total that is
+never reconciled -- wrong, plausible, and non-deterministic.
+
+---
+
+### D-051 — Key skew is instrumented, because it is otherwise invisible
+
+`ParallelMetrics::records_per_subtask` exists to make skew legible. Hash
+partitioning sends every record for one key to one subtask, so a single hot key
+caps the whole job at one core's throughput regardless of configured parallelism.
+**Adding threads cannot fix it; only changing the key can.**
+
+Asserted directly in `ConcentratesAHotKeyOnASingleSubtask`: with one key and four
+subtasks, one handles everything and three are idle. Without the metric this
+presents as "the job is mysteriously slower than the thread count suggests".
+
+Queue capacity defaults small (64) deliberately. A large capacity delays the
+onset of backpressure and hides a slow stage behind a deep buffer; it does not
+make the pipeline faster, only the problem later and less visible.
+
+---
+
+### D-052 — Backpressure is demonstrated with a negative control
+
+`PropagatesBackpressureFromASlowSinkToTheSource` uses a deliberately slow sink
+and asserts both counters rise: blocks on the sink queue (the sink is the
+bottleneck) *and* blocks on the input queues (the pressure reached the source).
+Records written must equal records produced -- backpressure throttles, it never
+drops.
+
+`DoesNotBlockOnTheSinkQueueWhenTheSinkKeepsUp` is the negative control, and it is
+the more important test of the two. Without it the first would pass on a pipeline
+that blocks unconditionally -- which would look like working backpressure and be
+a permanent throughput ceiling.
+
+---
+
+### D-053 — False sharing on queue metadata
+
+Each queue is a separate heap allocation (`unique_ptr`), so one queue's mutex and
+block counters do not share a cache line with a neighbouring queue's. Two
+subtasks hammering adjacent mutexes on one line would ping-pong that line between
+cores -- contention on data the threads never actually share.
+
+Whether padding *within* a queue matters (between `not_full_` and `not_empty_`,
+say) is left to Stage 9 to measure. Adding `alignas` on a guess is exactly the
+micro-optimisation this project defers until a benchmark points at it.
+
+---
+
+### Bug found by the test suite — dangling sink pointer
+
+The first version of the oracle test built the sequential `Pipeline` in an inner
+scope and read its sink through a raw pointer afterwards. `Pipeline` **owns** its
+sink, so the pointer dangled the moment the pipeline was destroyed. It segfaulted
+immediately.
+
+Recorded because the fix is a habit rather than a patch: results are now copied
+out *inside* the owning scope. The same shape -- `sink.get()` before
+`.to(std::move(sink))` -- appears throughout the test suite and is only safe while
+the pipeline outlives the read.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -1033,7 +1171,7 @@ correct shutdown is the default rather than a discipline.
 | 3 | Windowing | **Complete** — 53 tests, clean under dev/gcc/asan/tsan |
 | 4 | Keyed state, backend, serialization | **Complete** — 84 tests, clean under dev/gcc/asan/tsan |
 | 5 | Concurrency primitives | **Complete** — 106 tests, TSan-clean under contention |
-| 6 | Parallelism, partitioning, backpressure | Not started |
+| 6 | Parallelism, partitioning, backpressure | **Complete** — 115 tests, TSan-clean over repeated runs |
 | 7 | Checkpointing (Chandy-Lamport ABS) | Not started |
 | 8 | Recovery and exactly-once | Not started |
 | 9 | Benchmarks and demo application | Not started |

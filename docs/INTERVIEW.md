@@ -416,6 +416,57 @@ than no check.
 
 ---
 
+## Stage 6 — Parallelism, partitioning, backpressure
+
+### Concepts covered
+
+- **The Stage 1 seam paying off.** `QueueCollector` replaced the direct-call
+  collector and no operator changed. The concrete vindication of rejecting CRTP.
+- **Where a variant belongs.** Closed engine-defined set (stream elements) yes;
+  open user-defined set (payloads) no. And the variant lives in the *transport*,
+  not the operator interface.
+- **Fan-out vs fan-in shutdown.** One producer can `close()`; N producers must
+  send end-of-stream as an element and have the consumer count channels.
+- **Why watermarks are broadcast, not partitioned**, and why they carry a channel
+  index.
+- **Min-across-channels in anger** — `WatermarkTracker` finally consumed.
+- **Partitioning removes locking rather than optimising it.** One backend per
+  subtask; a shared backend behind a mutex fails to scale, not merely runs slower.
+- **Key skew.** A hot key caps the job at one core; more threads cannot help.
+- **Backpressure end to end**, and why the negative control matters more than the
+  positive test.
+- **False sharing** on queue metadata, and why padding is a Stage 9 measurement
+  rather than a guess.
+- **The oracle and TSan find disjoint bug classes** — demonstrated, not asserted.
+
+### Questions to be able to answer cold
+
+1. You made the engine parallel. How much operator code changed, and why?
+2. Why is `std::variant` right for stream elements but wrong for record
+   payloads? (Same question as Stage 1, from the other side.)
+3. Why can't the sink queue simply be `close()`d when a subtask finishes?
+4. Why does a watermark carry a channel index? What breaks without it?
+5. Why is a watermark broadcast to every subtask rather than partitioned like a
+   record?
+6. Keyed state has no lock. Trace exactly why that is safe in the parallel case.
+7. One key accounts for 40% of your traffic. What happens, and what can you do
+   about it?
+8. Walk backpressure from a slow sink to the source. What component decides to
+   slow down?
+9. Your backpressure test passes. What would also make it pass if backpressure
+   were broken, and how do you rule that out?
+10. Parallel output matches sequential output on 10,000 runs. What have you
+    proved, and what have you not?
+
+### Struggled with — revision list
+
+- **Unverified** — built without the comprehension gate. Questions 3, 4, 6, 9 and
+  10 are the highest-value: 3 and 4 are design details you only meet by building
+  a shuffle, and 9 and 10 are the correctness-methodology questions that tie the
+  whole project together.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview
