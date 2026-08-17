@@ -1,6 +1,7 @@
 #include <ripple/checkpoint/checkpoint_coordinator.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <mutex>
 #include <optional>
@@ -12,7 +13,8 @@ namespace ripple {
 CheckpointId CheckpointCoordinator::trigger(std::size_t source_offset, std::size_t parallelism) {
     const std::lock_guard<std::mutex> lock(mutex_);
     const CheckpointId id = next_id_++;
-    pending_[id] = CompletedCheckpoint{id, source_offset, parallelism, {}};
+    pending_[id] = CompletedCheckpoint{id, source_offset, parallelism, {}, {}};
+    started_[id] = std::chrono::steady_clock::now();
     return id;
 }
 
@@ -38,6 +40,9 @@ void CheckpointCoordinator::acknowledge(CheckpointId id, TaskId task,
     // Every task has reported. Only now does this checkpoint become usable --
     // a partial checkpoint is not partially useful, it is corrupt, because the
     // set of snapshots would not describe a single consistent cut.
+    entry->second.duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started_[id]);
+    started_.erase(id);
     completed_.push_back(std::move(entry->second));
     pending_.erase(entry);
 }

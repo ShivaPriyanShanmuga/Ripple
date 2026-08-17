@@ -302,6 +302,16 @@ struct Serializer<Timestamp> {
     }
 };
 
+/// Carries no data, so it writes none. Present so that an unkeyed window
+/// operator -- whose key type is this -- can be snapshotted through exactly the
+/// same code path as a keyed one.
+template<>
+struct Serializer<GlobalWindowKey> {
+    static void write(ByteWriter& /*writer*/, const GlobalWindowKey& /*value*/) {}
+
+    [[nodiscard]] static GlobalWindowKey read(ByteReader& /*reader*/) { return {}; }
+};
+
 template<>
 struct Serializer<TimeWindow> {
     static void write(ByteWriter& writer, const TimeWindow& value) {

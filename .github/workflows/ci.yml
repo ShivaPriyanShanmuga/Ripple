@@ -70,7 +70,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          find include src tests -type f \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null \
+          find include src tests apps benchmarks -type f \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null \
             | xargs --no-run-if-empty clang-format --dry-run --Werror
 
       # clang-tidy needs compile_commands.json, so it needs a configured build
@@ -80,5 +80,5 @@ jobs:
 
       - name: Run clang-tidy
         run: |
-          find include src tests -type f -name '*.cpp' 2>/dev/null \
+          find include src tests apps -type f -name '*.cpp' 2>/dev/null \
             | xargs --no-run-if-empty clang-tidy -p build/dev --warnings-as-errors='*'

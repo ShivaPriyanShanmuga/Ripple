@@ -4,6 +4,7 @@
 #include <ripple/operators/window.hpp>
 #include <ripple/pipeline.hpp>
 #include <ripple/record.hpp>
+#include <ripple/serialization.hpp>
 #include <ripple/sink.hpp>
 #include <ripple/source.hpp>
 #include <ripple/timestamp.hpp>
@@ -15,7 +16,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -23,6 +26,7 @@ namespace {
 
 using ripple::CountAggregator;
 using ripple::Duration;
+using ripple::GlobalWindowKey;
 using ripple::Record;
 using ripple::SessionWindows;
 using ripple::SlidingWindows;
@@ -160,15 +164,15 @@ TEST(SessionWindowsTest, AssignsAProvisionalWindowOfOneGap) {
 // ---------------------------------------------------------------------------
 
 template<typename T>
-class ResultCollector final : public ripple::Collector<WindowResult<T>> {
+class ResultCollector final : public ripple::Collector<WindowResult<GlobalWindowKey, T>> {
 public:
-    void collect(Record<WindowResult<T>>&& record) override {
+    void collect(Record<WindowResult<GlobalWindowKey, T>>&& record) override {
         results.push_back(std::move(record));
     }
 
     void emit_watermark(Watermark watermark) override { watermarks.push_back(watermark); }
 
-    std::vector<Record<WindowResult<T>>> results;
+    std::vector<Record<WindowResult<GlobalWindowKey, T>>> results;
     std::vector<Watermark> watermarks;
 };
 
@@ -335,6 +339,108 @@ TEST(SessionWindowOperatorTest, DoesNotMergeSessionsSeparatedByExactlyTheGap) {
 }
 
 // ---------------------------------------------------------------------------
+// Keyed windows
+// ---------------------------------------------------------------------------
+
+template<typename Key, typename T>
+class KeyedResultCollector final : public ripple::Collector<ripple::WindowResult<Key, T>> {
+public:
+    void collect(Record<ripple::WindowResult<Key, T>>&& record) override {
+        results.push_back(std::move(record));
+    }
+
+    void emit_watermark(Watermark watermark) override { watermarks.push_back(watermark); }
+
+    std::vector<Record<ripple::WindowResult<Key, T>>> results;
+    std::vector<Watermark> watermarks;
+};
+
+struct Sale {
+    std::string region;
+    std::int64_t amount;
+};
+
+// Protects: each key keeps its own independent set of windows.
+//
+// The property "per-region revenue in 5-minute windows" actually requires. If
+// keys shared a window's accumulator, every region's revenue would be summed
+// together and the result would look like one very successful region.
+TEST(KeyedWindowTest, MaintainsIndependentWindowsPerKey) {
+    auto op = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{});
+    KeyedResultCollector<std::string, std::int64_t> out;
+
+    op->process(ripple::make_record(Sale{"north", 10}, ms(100)), out);
+    op->process(ripple::make_record(Sale{"south", 3}, ms(200)), out);
+    op->process(ripple::make_record(Sale{"north", 5}, ms(300)), out);
+
+    EXPECT_EQ(op->keyed_state_size(), 2U);
+    EXPECT_EQ(op->open_window_count(), 2U) << "one window per key, not one shared";
+
+    op->on_watermark(Watermark{ms(1'000)}, out);
+
+    ASSERT_EQ(out.results.size(), 2U);
+    std::map<std::string, std::int64_t> totals;
+    for (const auto& result : out.results) {
+        totals[result.value.key] = result.value.value;
+    }
+    EXPECT_EQ(totals["north"], 15);
+    EXPECT_EQ(totals["south"], 3);
+}
+
+// Protects: a key whose windows have all been purged is itself released.
+//
+// Without this the window maps shrink but the key map grows forever -- a leak
+// proportional to key cardinality, which for something like a user id is
+// unbounded. It is the slow, invisible way a keyed windowed job dies.
+TEST(KeyedWindowTest, ReleasesKeysWhoseWindowsHaveAllExpired) {
+    auto op = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{});
+    KeyedResultCollector<std::string, std::int64_t> out;
+
+    for (int i = 0; i < 50; ++i) {
+        op->process(ripple::make_record(Sale{"region-" + std::to_string(i), 1}, ms(100)), out);
+    }
+    EXPECT_EQ(op->keyed_state_size(), 50U);
+
+    op->on_watermark(Watermark{ms(10'000)}, out);
+
+    EXPECT_EQ(op->open_window_count(), 0U);
+    EXPECT_EQ(op->keyed_state_size(), 0U) << "keys leaked after their windows were purged";
+}
+
+// Protects: session merging happens within a key, never across keys.
+//
+// Two users active at overlapping times are two sessions, not one. Merging
+// across keys would silently join unrelated users' activity.
+TEST(KeyedWindowTest, MergesSessionsWithinAKeyButNotAcrossKeys) {
+    auto op = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        SessionWindows{Duration{1'000}}, SumAggregator<std::int64_t>{});
+    KeyedResultCollector<std::string, std::int64_t> out;
+
+    // Two keys, interleaved in time so their raw windows overlap.
+    op->process(ripple::make_record(Sale{"north", 1}, ms(0)), out);
+    op->process(ripple::make_record(Sale{"south", 100}, ms(100)), out);
+    op->process(ripple::make_record(Sale{"north", 2}, ms(500)), out);
+    op->process(ripple::make_record(Sale{"south", 200}, ms(600)), out);
+
+    EXPECT_EQ(op->keyed_state_size(), 2U);
+    EXPECT_EQ(op->open_window_count(), 2U) << "one merged session per key";
+
+    op->on_watermark(Watermark{ms(100'000)}, out);
+
+    std::map<std::string, std::int64_t> totals;
+    for (const auto& result : out.results) {
+        totals[result.value.key] = result.value.value;
+    }
+    EXPECT_EQ(totals["north"], 3);
+    EXPECT_EQ(totals["south"], 300) << "sessions merged across keys";
+}
+
+// ---------------------------------------------------------------------------
 // Late data
 // ---------------------------------------------------------------------------
 
@@ -408,6 +514,92 @@ TEST(LateDataTest, AllowedLatenessAdmitsLateRecordsAndReFiresTheWindow) {
 }
 
 // ---------------------------------------------------------------------------
+// Checkpointing window state
+// ---------------------------------------------------------------------------
+
+// Protects: window contents survive a snapshot/restore round trip.
+//
+// This test exists because the demo application found the bug. Window state is
+// *operator* state -- it lives in the operator's own map, not in the
+// StateBackend, because it is indexed by (key, window) which the backend's flat
+// key-value interface does not model. So the backend snapshot does not cover it,
+// and before `snapshot_state` was implemented here a windowed job checkpointed
+// nothing at all.
+//
+// The symptom was not a crash or an error. Recovery restarted every
+// partially-filled window from empty, and the recovered run produced totals that
+// were plausible and quietly short -- which is the hardest kind of wrong to
+// notice.
+TEST(WindowCheckpointTest, RoundTripsWindowContentsAndWatermark) {
+    auto original = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{}, Duration{5'000});
+    KeyedResultCollector<std::string, std::int64_t> out;
+
+    original->process(ripple::make_record(Sale{"north", 10}, ms(100)), out);
+    original->process(ripple::make_record(Sale{"north", 5}, ms(200)), out);
+    original->process(ripple::make_record(Sale{"south", 7}, ms(1'500)), out);
+    original->on_watermark(Watermark{ms(1'000)}, out);
+    ASSERT_EQ(out.results.size(), 1U) << "the first window should have fired";
+
+    ripple::ByteWriter writer;
+    original->snapshot_state(writer);
+
+    auto restored = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{}, Duration{5'000});
+    ripple::ByteReader reader(writer.bytes());
+    restored->restore_state(reader);
+    EXPECT_TRUE(reader.exhausted()) << "snapshot and restore disagree about the layout";
+
+    EXPECT_EQ(restored->open_window_count(), original->open_window_count());
+    EXPECT_EQ(restored->keyed_state_size(), original->keyed_state_size());
+
+    // The restored operator must not re-emit a window that had already fired --
+    // the `dirty` flag is part of the state. Re-firing would produce a duplicate
+    // result for a window that was already complete.
+    KeyedResultCollector<std::string, std::int64_t> restored_out;
+    restored->on_watermark(Watermark{ms(1'000)}, restored_out);
+    EXPECT_TRUE(restored_out.results.empty()) << "a already-fired window fired again on restore";
+
+    // ...but a window still open at the snapshot must fire with its full total.
+    restored->on_watermark(Watermark{ms(10'000)}, restored_out);
+    ASSERT_EQ(restored_out.results.size(), 1U);
+    EXPECT_EQ(restored_out.results[0].value.key, "south");
+    EXPECT_EQ(restored_out.results[0].value.value, 7);
+}
+
+// Protects: the restored watermark is honoured, so records already declared late
+// stay late.
+//
+// Restoring windows without the watermark would leave the operator believing no
+// time had passed, and it would happily re-admit records it had already rejected
+// -- resurrecting data into windows that downstream had been told were final.
+TEST(WindowCheckpointTest, RestoresTheWatermarkSoLateRecordsStayLate) {
+    auto original = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{});
+    KeyedResultCollector<std::string, std::int64_t> out;
+    original->on_watermark(Watermark{ms(50'000)}, out);
+
+    ripple::ByteWriter writer;
+    original->snapshot_state(writer);
+
+    auto restored = ripple::make_keyed_window<Sale>(
+        [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
+        TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{});
+    ripple::ByteReader reader(writer.bytes());
+    restored->restore_state(reader);
+
+    KeyedResultCollector<std::string, std::int64_t> restored_out;
+    restored->process(ripple::make_record(Sale{"north", 10}, ms(100)), restored_out);
+
+    EXPECT_EQ(restored->late_record_count(), 1U)
+        << "a record older than the restored watermark was admitted";
+    EXPECT_EQ(restored->open_window_count(), 0U);
+}
+
+// ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------
 
@@ -423,7 +615,8 @@ TEST(WindowPipelineTest, AggregatesTumblingWindowsEndToEnd) {
         input.push_back(ripple::make_record(1, ms(i * 500))); // one every 500ms
     }
 
-    auto sink = std::make_unique<ripple::CollectingSink<WindowResult<std::size_t>>>();
+    auto sink =
+        std::make_unique<ripple::CollectingSink<WindowResult<GlobalWindowKey, std::size_t>>>();
     auto* sink_ptr = sink.get();
 
     auto pipeline =

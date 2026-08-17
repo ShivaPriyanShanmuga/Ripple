@@ -1,0 +1,16 @@
+---
+# Inherits the project configuration and relaxes exactly one family of checks.
+#
+# These are console programs whose entire job is formatted output, and
+# `printf` is the clearest way to lay out a fixed-width report. The
+# alternatives are iostream manipulator soup or hand-padded `std::format`
+# calls, neither of which is safer here -- every format string is a literal in
+# the same function as its arguments.
+#
+# Scoped to this directory rather than disabled project-wide: the library and
+# the tests keep the check, where a vararg call really would be a smell.
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-avoid-c-arrays,
+  -modernize-avoid-c-arrays

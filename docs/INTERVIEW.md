@@ -651,6 +651,65 @@ test proves only what it exercised.
 
 ---
 
+## Stage 9 — Benchmarks and the demo application
+
+### Concepts covered
+
+- **Keyed windows** sharing one implementation with the global case, and the key
+  leak that nesting introduces.
+- **Operator chaining** and why adjacent stages should not be separated by a
+  queue.
+- **Operator state vs backend state** — and that a stateful operator can look
+  checkpointed while checkpointing nothing.
+- **Percentiles over means**, and why p99.9 specifically.
+- **Three ways a latency harness lies**: pacing finer than the scheduler,
+  measuring from the wrong clock origin, and mismatching the source's batching.
+- **Reading a benchmark**: queue capacity as a 25x effect, sliding-window cost
+  linear in windows/record, state access O(log n), oversubscription reversing
+  the benefit of parallelism.
+- **The poison-timestamp hazard** — one bad future timestamp discarding the rest
+  of the stream, and why the watermark generator cannot defend itself.
+
+### The two findings worth describing
+
+**The demo found a real bug.** `WindowOperator` inherited the default no-op
+`snapshot_state`, so windowed jobs checkpointed nothing. Recovery restarted every
+partially-filled window from empty and produced totals that were plausible and
+quietly short. Nothing crashed. A default that is correct for most implementers
+(map, filter) was a trap for the one it was wrong for.
+
+**A single trip stamped in 2096 silently discarded 70% of the stream.** The
+watermark follows the maximum event time seen, so one bad record pushes it
+decades ahead and everything after it is late. The generator cannot defend itself
+because monotonicity is what makes watermarks safe. And the first sanitizer bound
+was too loose to catch it — the symptom was a plausible report missing most of
+its rows.
+
+### Questions to be able to answer cold
+
+1. Why report p99.9 and not just a mean? Give a distribution where the mean
+   misleads.
+2. You pace a source at 200k rec/s by sleeping between records. What actually
+   happens, and what does your latency graph really show?
+3. Why does queue capacity change throughput by 25x?
+4. Your job gets slower when you increase parallelism from 4 to 8. Why might that
+   be?
+5. A stateful operator stores state in its own member map rather than the state
+   backend. What breaks, and would any test notice?
+6. One record arrives with a timestamp 70 years in the future. What happens to
+   the rest of your stream, and whose job is it to prevent that?
+7. Why can't the watermark generator just ignore implausible timestamps itself?
+8. Where would you optimise this engine first, and what number are you using to
+   decide?
+
+### Struggled with — revision list
+
+- **Unverified.** Questions 2, 5, 6 and 7 come directly from bugs found while
+  building this stage and are the ones with real stories attached — those are the
+  ones worth rehearsing.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

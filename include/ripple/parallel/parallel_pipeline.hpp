@@ -15,6 +15,7 @@
 #include <ripple/watermark.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -83,6 +85,17 @@ struct ParallelConfig {
 };
 
 /// Everything a run needs beyond its input, sink and coordinator.
+/// Records emitted per pacing sleep.
+///
+/// Exposed rather than kept private because a harness measuring latency has to
+/// compute the *same* schedule the source paced against. All records in a batch
+/// enter the pipeline together at the batch's due time, so measuring each one
+/// against its own nominal slot reports negative latency for everything but the
+/// first -- an artifact, not a fast pipeline. One definition, used by both.
+[[nodiscard]] constexpr std::size_t pacing_batch_size(std::size_t records_per_second) noexcept {
+    return records_per_second / 1'000 > 0 ? records_per_second / 1'000 : 1;
+}
+
 struct RunOptions {
     /// Restore from this checkpoint instead of starting fresh. Each subtask's
     /// state backend is repopulated from it and the source rewinds to its
@@ -111,6 +124,17 @@ struct RunOptions {
     /// recovery replays from the last completed checkpoint's offset, which
     /// re-delivers exactly the records a graceful drain may have delivered.
     std::optional<std::size_t> fail_after_records = std::nullopt;
+
+    /// Feed the source at a fixed rate rather than flat out. Zero means
+    /// unlimited, which is what throughput measurement wants.
+    ///
+    /// Latency measured on a *saturated* pipeline is dominated by queueing and
+    /// grows with input size -- it measures how deep the backlog got, not how
+    /// long a record takes to get through. Pacing below saturation is what makes
+    /// a latency percentile mean the latter, which is the number anyone actually
+    /// wants. Reporting a saturated latency as if it were the second is one of
+    /// the more common ways benchmarks mislead.
+    std::size_t target_records_per_second = 0;
 };
 
 struct ParallelMetrics {
@@ -121,6 +145,15 @@ struct ParallelMetrics {
     std::vector<std::size_t> records_per_subtask;
     std::vector<std::size_t> input_queue_push_blocks;
     std::size_t sink_queue_push_blocks = 0;
+
+    /// When the source began emitting.
+    ///
+    /// Exposed because a latency measurement has to use the same clock origin
+    /// the source paced against. Timing from before `run()` folds pipeline
+    /// setup -- thread spawn, backend construction -- into every single record's
+    /// latency as a constant offset, which then swamps the number being
+    /// measured and looks like a uniformly slow pipeline.
+    std::chrono::steady_clock::time_point source_started_at{};
 
     /// How many elements the sink set aside while waiting for a barrier to
     /// arrive on every channel. This is the **cost of alignment** made visible: a
@@ -219,11 +252,45 @@ public:
                 options.restore_from != nullptr ? options.restore_from->source_offset : 0;
             const std::size_t start = offset;
 
+            const auto run_started_at = std::chrono::steady_clock::now();
+            source_started_at_ = run_started_at;
+
             for (std::size_t index = start; index < input.size(); ++index) {
                 if (options.fail_after_records.has_value() &&
                     offset >= *options.fail_after_records) {
                     break;
                 }
+
+                if (options.target_records_per_second > 0) {
+                    // Paced in batches, against an absolute schedule.
+                    //
+                    // Two things are deliberate here, and getting either wrong
+                    // silently produces a benchmark that measures nothing.
+                    //
+                    // *Absolute* schedule from the run's start rather than a
+                    // sleep per record: a fixed per-record sleep accumulates the
+                    // scheduler's overshoot on every iteration and drifts badly
+                    // over a long run.
+                    //
+                    // *Batched* because a sleep shorter than the scheduler's
+                    // granularity (~50us on Linux) overshoots by an order of
+                    // magnitude. At 200k rec/s the per-record interval is 5us,
+                    // so sleeping per record puts the deadline permanently in
+                    // the past, `sleep_until` returns immediately every time,
+                    // and pacing degrades into running flat out -- while the
+                    // harness still reports the result as "paced latency". That
+                    // is a benchmark quietly measuring saturation instead.
+                    // Sleeping roughly every millisecond's worth of records
+                    // keeps each sleep well above the granularity floor.
+                    const std::size_t batch = pacing_batch_size(options.target_records_per_second);
+                    if ((index - start) % batch == 0) {
+                        const auto due = run_started_at + std::chrono::nanoseconds{
+                                                              (index - start) * 1'000'000'000ULL /
+                                                              options.target_records_per_second};
+                        std::this_thread::sleep_until(due);
+                    }
+                }
+
                 Record<In>& record = input[index];
                 // Route by key group, never by `hash % parallelism` directly.
                 // A key's group never changes; only which subtask owns that
@@ -531,6 +598,7 @@ private:
         metrics_.sink_queue_push_blocks = sink_queue.push_block_count();
         metrics_.records_per_subtask = records_per_subtask;
         metrics_.alignment_buffered_elements = sink_task.buffered_count();
+        metrics_.source_started_at = source_started_at_;
     }
 
     /// Assembles one subtask's state from a checkpoint, which may have been
@@ -566,6 +634,7 @@ private:
     KeySelector key_selector_;
     OperatorFactory make_operator_;
     ParallelMetrics metrics_;
+    std::chrono::steady_clock::time_point source_started_at_{};
 };
 
 /// `key_selector` maps a payload to its key. The **same** function the keyed

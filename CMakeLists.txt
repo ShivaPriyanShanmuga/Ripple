@@ -145,3 +145,9 @@ if(RIPPLE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+if(RIPPLE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
+add_subdirectory(apps)

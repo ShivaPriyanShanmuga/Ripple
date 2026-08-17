@@ -46,13 +46,44 @@ struct TimeWindow {
     friend std::strong_ordering operator<=>(const TimeWindow&, const TimeWindow&) = default;
 };
 
-/// A window's computed result, tagged with the window it came from.
+/// The key of a stream whose windows are global rather than per-key.
 ///
-/// The window must travel with the value: downstream has no other way to know
-/// which interval a number refers to, and with allowed lateness the same window
-/// can be emitted more than once.
-template<typename T>
+/// A unit type rather than, say, an unused `int`: it makes "this stream is not
+/// keyed" a statement in the type system instead of a convention, and costs
+/// nothing at runtime.
+struct GlobalWindowKey {
+    friend bool operator==(const GlobalWindowKey&, const GlobalWindowKey&) = default;
+    friend std::strong_ordering operator<=>(const GlobalWindowKey&,
+                                            const GlobalWindowKey&) = default;
+};
+
+/// Selects `GlobalWindowKey` for every record, collapsing a keyed window
+/// operator into a global one. The default, so that windowing an unkeyed stream
+/// needs no ceremony.
+struct GlobalKeySelector {
+    template<typename T>
+    [[nodiscard]] GlobalWindowKey operator()(const T& /*value*/) const noexcept {
+        return {};
+    }
+};
+
+/// Passes the payload through unchanged. The default value selector, so that
+/// windowing a stream of plain numbers needs no projection.
+struct IdentitySelector {
+    template<typename T>
+    [[nodiscard]] const T& operator()(const T& value) const noexcept {
+        return value;
+    }
+};
+
+/// A window's computed result, tagged with the key and window it came from.
+///
+/// Both must travel with the value: downstream has no other way to know which
+/// interval, or whose, a number refers to -- and with allowed lateness the same
+/// (key, window) pair can be emitted more than once.
+template<typename Key, typename T>
 struct WindowResult {
+    Key key;
     TimeWindow window;
     T value;
 };

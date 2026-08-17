@@ -1458,6 +1458,188 @@ actually exercised.*
 
 ---
 
+### D-064 — Windows become keyed, sharing one implementation with the global case
+
+Closes the gap recorded at the end of Stage 4. `WindowOperator` now takes a
+`KeySelector` (whose window is this) and a `ValueSelector` (what part of the
+record is aggregated), holding `key -> window -> accumulator`.
+
+With the default `GlobalKeySelector` there is exactly one key and the operator
+behaves as an unkeyed windower, so the two cases share one implementation rather
+than one being a copy of the other with an extra map.
+
+Windows are nested *under* the key rather than keyed by a flat `(key, window)`
+pair, because session merging must scan a single key's windows in time order. A
+flat map ordered by `(key, window)` would happen to work, but only by accident of
+that ordering.
+
+**A leak this introduced and closes:** purging a key's last window leaves an
+empty entry in the key map. Without erasing it, the window maps shrink while the
+*key* map grows forever -- unbounded for something like a user id. The same
+failure the state backend guards against in D-037, asserted by
+`ReleasesKeysWhoseWindowsHaveAllExpired`.
+
+---
+
+### D-065 — Operator chaining
+
+`ChainedOperator<In, Mid, Out>` runs two operators as one, with the first writing
+into an adapter that is a `Collector<Mid>` feeding the second.
+
+**Why chain rather than give each operator its own thread and queue:** for
+adjacent stages a queue is strictly worse -- every record pays a mutex, a
+condition-variable notify and a thread handoff to travel a few nanoseconds of
+actual work. Real engines chain and break the chain only where the topology
+forces a shuffle. The measured queue handoff cost below makes this concrete.
+
+It needs no cooperation from either operator: neither knows it is chained. This
+is the third distinct use of the `Collector` seam from D-014, after the
+direct-call collector and the queue collector.
+
+Watermarks route *through* the adapter rather than around it, deliberately. The
+first operator may react to a watermark by emitting records (a window firing),
+and those records must reach the second before the watermark does -- otherwise
+the second treats its upstream's output as late.
+
+---
+
+### D-066 — Window contents are operator state, and were not being checkpointed
+
+**A real bug, found by running the demo application rather than by reasoning.**
+
+Window state lives in the operator's own map, not in the `StateBackend`, because
+it is indexed by `(key, window)` which the backend's flat key-value interface
+does not model. The backend snapshot therefore does not cover it -- and
+`WindowOperator` inherited the no-op `snapshot_state` from D-040. **A windowed
+job checkpointed nothing at all.**
+
+The symptom was not a crash. Recovery restarted every partially-filled window
+from empty and produced totals that were plausible and quietly short. The demo
+surfaced it as "results identical to an uninterrupted run: NO".
+
+Fixed by implementing `snapshot_state`/`restore_state` on the window operator,
+including `current_watermark_` -- restoring windows without it would leave the
+operator believing no time had passed, so it would re-admit records it had
+already declared late, resurrecting data into windows downstream had been told
+were final.
+
+Two regression tests now cover it, including that a window which had already
+fired does **not** fire again after restore: the `dirty` flag is part of the
+state, and re-firing would duplicate a completed window.
+
+*The general lesson: the Stage 4 decision to default `snapshot_state` to a no-op
+was right for map and filter, and it silently made a stateful operator look
+checkpointed when it was not. A default that is correct for most implementers is
+still a trap for the ones it is wrong for.*
+
+---
+
+### D-067 — Benchmark methodology, and two ways a harness lies
+
+**Percentiles, never a mean alone.** A mean latency hides exactly the behaviour
+that matters: a pipeline answering in 1ms 99% of the time and 900ms the rest has
+a mean near 10ms, describing no request that ever happened. p50/p90/p99/p99.9 and
+max are reported; the mean is printed last, labelled, and only alongside them.
+
+**Google Benchmark for components, a custom harness end to end.** Google
+Benchmark repeats a small operation until the timing stabilises, which is the
+wrong shape for "run a multi-threaded pipeline once and describe how it
+behaved" -- that produces a distribution and a few one-shot durations.
+
+**Two measurement bugs found and fixed while building this**, both of which
+produced confident, wrong numbers:
+
+1. **Pacing finer than the scheduler.** At 200k rec/s the per-record interval is
+   5us; `sleep_until` overshoots by an order of magnitude, the deadline goes
+   permanently into the past, and pacing silently degrades to running flat out --
+   while the harness still labels the result "paced latency". It was measuring
+   saturation. Fixed by pacing in batches of roughly a millisecond's worth of
+   records.
+2. **Measuring against the wrong clock origin.** Timing from before `run()` folds
+   pipeline setup -- thread spawn, backend construction -- into every record as a
+   constant offset. It showed as a uniform ~3.4ms p50 with a suspiciously tight
+   spread. Fixed by exposing `ParallelMetrics::source_started_at`, the origin the
+   source actually paced against.
+
+A third artifact followed the first fix: batching means every record in a batch
+enters together, so measuring each against its own nominal slot reports negative
+latency for all but the first. `pacing_batch_size` is public so the harness
+computes the same schedule the source used.
+
+*All three produced plausible-looking numbers. A benchmark that is wrong is worse
+than no benchmark, for the same reason a green test that exercises nothing is --
+it converts ignorance into confidence.*
+
+---
+
+### D-068 — What the numbers actually say
+
+Measured on an 11th Gen Intel i5-1135G7 (4 cores / 8 threads, 2.4 GHz), 8 GB RAM,
+WSL2 on Ubuntu 24.04, Clang 18, `release` preset (`-O3 -DNDEBUG`).
+
+| Component | Result |
+| --- | --- |
+| Tumbling window assignment | ~1.1 ns/record |
+| Sliding assignment, 2 / 10 / 60 windows | 5.7 / 16.1 / 104 ns -- **linear in windows per record**, as D-028 predicted |
+| Key-group hash | ~12 ns |
+| Serialize int64 / 64-byte string | 31 / 56 ns |
+| Keyed state RMW, 1 / 100 / 10k keys | 80 / 135 / 257 ns -- the ordered map's O(log n) |
+| Queue push+pop, uncontended | 22 ns |
+| Queue 1P1C, capacity 8 | **173k items/s** |
+| Queue 1P1C, capacity 1024 | **4.35M items/s** |
+
+**The headline finding is the last two rows: a 25x throughput difference from
+queue capacity alone.** At capacity 8 the producer and consumer ping-pong on the
+condition variable and spend their time in the scheduler rather than moving data.
+That is the concrete argument both for chaining adjacent operators (D-065) and
+against a small default capacity -- and it is the kind of thing that is invisible
+without a benchmark, which is exactly why optimisation was deferred to this stage
+rather than guessed at earlier.
+
+End-to-end, 4 subtasks, Zipf-skewed keys: ~555k records/s unpaced; at a paced
+200k/s the latency distribution is p50 346us, p99 1.16ms, p99.9 1.37ms. Note that
+throughput *fell* from parallelism 4 to 8 -- at parallelism 8 the job wants ten
+threads on an 8-thread machine, and oversubscription costs more than the extra
+width buys.
+
+Checkpointing every 50k records cost **3.5%** throughput, with checkpoint
+durations around 2ms. Recovery after a kill at the halfway point took 0.24s,
+dominated by replaying the 100k records since the last checkpoint rather than by
+loading state -- which is the real argument for frequent checkpoints, and the
+number to trade the 3.5% against.
+
+---
+
+### D-069 — The demo, and the poison-timestamp hazard
+
+Per-zone revenue in 5-minute tumbling windows, plus sessionization by vehicle
+with a 30-minute inactivity gap, both on the parallel runtime with checkpointing,
+followed by a kill and recovery.
+
+The generator reproduces the properties of the real TLC data that made it worth
+choosing (D-013) -- skew, out-of-order arrival, and dirty records -- while
+running anywhere with no download. It is seeded.
+
+**The hazard the dirty data exposed**, which is the most useful thing the demo
+teaches: bounded out-of-orderness derives the watermark from the **maximum event
+time seen** (D-024). One trip stamped in 2096 drags the watermark to 2096 minus
+the bound, and every subsequent record -- all valid -- is now late. **A single
+broken meter silently discards the rest of the stream.**
+
+The watermark generator cannot defend itself: monotonicity is exactly what makes
+watermarks safe, so it cannot regress. The defence must be upstream -- reject
+implausible timestamps before they can influence time at all.
+
+And the bound has to be tight enough to actually catch the bad data. The first
+version of the sanitizer allowed anything before the year 3000 while the broken
+meters stamp 2096, so the poison sailed through and **roughly 70% of all windows
+silently never fired**. The symptom was not an error but a plausible-looking
+report missing most of its rows. A real deployment validates against a
+*business*-plausible range ("not more than an hour ahead of ingestion"), not
+against the limits of the timestamp type.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -1471,5 +1653,5 @@ actually exercised.*
 | 6 | Parallelism, partitioning, backpressure | **Complete** — 115 tests, TSan-clean over repeated runs |
 | 7 | Checkpointing (Chandy-Lamport ABS) | **Complete** — 125 tests, alignment verified by disabling it |
 | 8 | Recovery and exactly-once | **Complete** — 139 tests, fault injection + rescaling via key groups |
-| 9 | Benchmarks and demo application | Not started |
+| 9 | Benchmarks and demo application | **Complete** — 144 tests, micro + end-to-end benchmarks, taxi demo |
 | 10 | README | Not started |

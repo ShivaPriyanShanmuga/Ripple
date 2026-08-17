@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -33,6 +34,15 @@ struct CompletedCheckpoint {
     /// different parallelism is a **rescale**, which redistributes key groups
     /// rather than restoring blob-for-blob.
     std::size_t parallelism = 0;
+
+    /// Wall time from the source injecting the barrier to the last task
+    /// acknowledging.
+    ///
+    /// The number that matters operationally: it is roughly the slowest single
+    /// task's snapshot plus however long the barrier took to reach it, which is
+    /// why D-058 forwards the barrier before snapshotting. A duration that grows
+    /// with state size is the signal to move to an asynchronous snapshot (D-057).
+    std::chrono::nanoseconds duration{0};
 
     /// Serialized state per task. Ordered so a checkpoint's contents are
     /// deterministic and comparable, for the same reason the state backend uses
@@ -105,6 +115,7 @@ private:
     std::size_t task_count_;
     CheckpointId next_id_ = 1;
     std::map<CheckpointId, CompletedCheckpoint> pending_;
+    std::map<CheckpointId, std::chrono::steady_clock::time_point> started_;
     std::vector<CompletedCheckpoint> completed_;
 };
 
