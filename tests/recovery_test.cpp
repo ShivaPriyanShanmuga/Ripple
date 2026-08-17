@@ -1,13 +1,18 @@
 #include <ripple/aggregators.hpp>
 #include <ripple/checkpoint/checkpoint_coordinator.hpp>
 #include <ripple/operator.hpp>
+#include <ripple/operators/chain.hpp>
 #include <ripple/operators/keyed.hpp>
+#include <ripple/operators/watermark_generator.hpp>
+#include <ripple/operators/window.hpp>
 #include <ripple/parallel/parallel_pipeline.hpp>
 #include <ripple/record.hpp>
 #include <ripple/sink.hpp>
 #include <ripple/sinks/idempotent_sink.hpp>
 #include <ripple/state/state_backend.hpp>
 #include <ripple/timestamp.hpp>
+#include <ripple/window.hpp>
+#include <ripple/window_assigners.hpp>
 
 #include <gtest/gtest.h>
 
@@ -18,6 +23,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -306,6 +312,144 @@ TEST(RecoveryTest, RescalesAfterACleanCheckpoint) {
     }
 
     EXPECT_EQ(final_totals(sink), expected);
+}
+
+// ---------------------------------------------------------------------------
+// Windowed recovery
+// ---------------------------------------------------------------------------
+
+// Protects: a WINDOWED parallel pipeline recovers correctly.
+//
+// This test exists because of a specific blind spot. Every other recovery test
+// here uses a keyed aggregate, whose state lives in the StateBackend and is
+// therefore covered by the backend snapshot. A window operator keeps its state in
+// its own map, because it is indexed by (key, window) which the backend's flat
+// interface does not model -- so it is covered only by
+// `Operator::snapshot_state`, which defaults to a no-op.
+//
+// That default meant windowed jobs checkpointed nothing at all, and no test in
+// this file noticed. It was found by running the demo application. Recovery
+// restarted every partially-filled window from empty and produced totals that
+// were plausible and quietly short -- no crash, no error, just a report missing
+// most of its rows.
+//
+// The lesson generalises past this bug: a test suite that only exercises one
+// *kind* of state proves nothing about the other kinds.
+using WindowedOutput = ripple::WindowResult<std::string, std::int64_t>;
+
+auto make_windowed_factory() {
+    return [](std::size_t, ripple::StateBackend&) {
+        auto watermarks =
+            ripple::make_bounded_out_of_orderness_watermarks<Trip>(ripple::Duration{50});
+        auto window = ripple::make_keyed_window<Trip>(
+            kZoneOf, kFareOf, ripple::TumblingWindows{ripple::Duration{500}},
+            SumAggregator<std::int64_t>{});
+        return std::unique_ptr<ripple::Operator<Trip, WindowedOutput>>(
+            ripple::make_chain<Trip, Trip, WindowedOutput>(std::move(watermarks), std::move(window),
+                                                           "windowed"));
+    };
+}
+
+auto make_windowed_pipeline(std::size_t parallelism) {
+    return ripple::make_parallel_pipeline<Trip, WindowedOutput>(
+        ripple::ParallelConfig{.parallelism = parallelism,
+                               .queue_capacity = 16,
+                               .checkpoint_interval_records = kCheckpointInterval},
+        kZoneOf, make_windowed_factory());
+}
+
+/// Windows are keyed by (zone, window start) and, because allowed lateness lets a
+/// window fire more than once, must be upserted rather than accumulated.
+std::map<std::pair<std::string, std::int64_t>, std::int64_t>
+window_totals(const std::vector<Record<WindowedOutput>>& records) {
+    std::map<std::pair<std::string, std::int64_t>, std::int64_t> totals;
+    for (const Record<WindowedOutput>& record : records) {
+        totals[{record.value.key, ripple::millis_since_epoch(record.value.window.start)}] =
+            record.value.value;
+    }
+    return totals;
+}
+
+TEST(WindowedRecoveryTest, RecoversWindowStateAcrossACrash) {
+    const std::vector<Record<Trip>> input = make_trips(kZones, 40);
+
+    // Reference: no failure.
+    std::map<std::pair<std::string, std::int64_t>, std::int64_t> expected;
+    {
+        ripple::CollectingSink<WindowedOutput> sink;
+        CheckpointCoordinator coordinator(kParallelism + 1);
+        auto pipeline = make_windowed_pipeline(kParallelism);
+        pipeline.run(input, sink, &coordinator);
+        expected = window_totals(sink.records());
+    }
+    ASSERT_FALSE(expected.empty()) << "the reference run produced no windows";
+
+    // Crash, then recover into the same result set -- as an idempotent sink
+    // downstream of a real job would.
+    ripple::CollectingSink<WindowedOutput> crashed_sink;
+    CheckpointCoordinator first_run(kParallelism + 1);
+    {
+        auto pipeline = make_windowed_pipeline(kParallelism);
+        pipeline.run(input, crashed_sink, &first_run, RunOptions{.fail_after_records = 120});
+    }
+    const CompletedCheckpoint checkpoint = require_latest(first_run);
+
+    ripple::CollectingSink<WindowedOutput> recovered_sink;
+    CheckpointCoordinator second_run(kParallelism + 1);
+    {
+        auto pipeline = make_windowed_pipeline(kParallelism);
+        pipeline.run(input, recovered_sink, &second_run, RunOptions{.restore_from = &checkpoint});
+    }
+
+    auto merged = window_totals(crashed_sink.records());
+    for (const auto& [key, value] : window_totals(recovered_sink.records())) {
+        merged[key] = value;
+    }
+
+    EXPECT_EQ(merged, expected)
+        << "windowed state did not survive the checkpoint -- window contents are operator "
+           "state and are only captured by Operator::snapshot_state";
+}
+
+// Protects: a windowed pipeline also survives a change in parallelism.
+//
+// Window state is *operator* state, which D-062 says is restored only at
+// unchanged parallelism -- so on a rescale the windows deliberately start empty
+// and the run replays from the checkpoint offset. This asserts that the outcome
+// is still correct rather than silently short, which is the property that
+// actually matters.
+TEST(WindowedRecoveryTest, RescalingAWindowedPipelineStillConverges) {
+    const std::vector<Record<Trip>> input = make_trips(kZones, 40);
+
+    std::map<std::pair<std::string, std::int64_t>, std::int64_t> expected;
+    {
+        ripple::CollectingSink<WindowedOutput> sink;
+        CheckpointCoordinator coordinator(kParallelism + 1);
+        auto pipeline = make_windowed_pipeline(kParallelism);
+        pipeline.run(input, sink, &coordinator);
+        expected = window_totals(sink.records());
+    }
+
+    ripple::CollectingSink<WindowedOutput> sink;
+    CheckpointCoordinator first_run(kParallelism + 1);
+    {
+        auto pipeline = make_windowed_pipeline(kParallelism);
+        pipeline.run(input, sink, &first_run, RunOptions{.fail_after_records = 100});
+    }
+    const CompletedCheckpoint checkpoint = require_latest(first_run);
+
+    ripple::CollectingSink<WindowedOutput> rescaled_sink;
+    CheckpointCoordinator second_run(2 + 1);
+    {
+        auto pipeline = make_windowed_pipeline(2);
+        pipeline.run(input, rescaled_sink, &second_run, RunOptions{.restore_from = &checkpoint});
+    }
+
+    auto merged = window_totals(sink.records());
+    for (const auto& [key, value] : window_totals(rescaled_sink.records())) {
+        merged[key] = value;
+    }
+    EXPECT_EQ(merged, expected);
 }
 
 // ---------------------------------------------------------------------------

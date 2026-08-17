@@ -621,12 +621,13 @@ private:
             ByteReader reader(blob);
             backend.merge_snapshot(reader, range);
 
-            // Operator state was written after the backend's, by the same task.
-            // Only meaningful when the parallelism is unchanged; on a rescale
-            // there is no defined way to redistribute it, so it is dropped.
-            if (task == subtask && checkpoint.parallelism == parallelism) {
-                op.restore_state(reader);
-            }
+            // Operator state is written after the backend's, by the same task,
+            // and is offered to *every* subtask with the range it now owns. An
+            // operator whose state is keyed -- a window operator's is -- keeps
+            // the groups it owns and drops the rest, so it redistributes exactly
+            // like backend state. One whose state is genuinely unkeyed ignores
+            // the range and restores nothing on a rescale.
+            op.restore_state(reader, range);
         }
     }
 

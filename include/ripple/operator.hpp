@@ -3,6 +3,7 @@
 #include <ripple/collector.hpp>
 #include <ripple/record.hpp>
 #include <ripple/serialization.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/watermark.hpp>
 
 #include <string_view>
@@ -49,10 +50,21 @@ public:
     /// exists is the expensive version of this work.
     virtual void snapshot_state(ByteWriter& /*writer*/) const {}
 
-    /// Must restore exactly what `snapshot_state` wrote. The two are a matched
-    /// pair, and `deserialize`'s full-consumption check is what catches them
-    /// drifting apart.
-    virtual void restore_state(ByteReader& /*reader*/) {}
+    /// Must read exactly what `snapshot_state` wrote. The two are a matched
+    /// pair, and `deserialize`'s full-consumption check catches them drifting.
+    ///
+    /// `range` names the key groups this task now owns. On a restore at the same
+    /// parallelism it is the whole keyspace and can be ignored; on a **rescale**
+    /// each task is handed every old snapshot in turn and must keep only the
+    /// groups it now owns -- so an implementation holding keyed state must be
+    /// **additive** across calls rather than clearing on each one.
+    ///
+    /// Operators whose state is genuinely unkeyed (a source offset, say) cannot
+    /// be redistributed this way and should restore only when the parallelism is
+    /// unchanged. None currently exist here; the distinction is why Flink
+    /// separates keyed state from operator state with union-list and split-list
+    /// redistribution.
+    virtual void restore_state(ByteReader& /*reader*/, KeyGroupRange /*range*/) {}
 };
 
 /// A transformation from `Record<In>` to zero or more `Record<Out>`.

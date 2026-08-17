@@ -710,6 +710,49 @@ its rows.
 
 ---
 
+## Comparison to Flink — the honest version
+
+**Ripple is not faster than Flink and is missing most of what Flink is.** Being
+able to say that crisply, and say exactly *what* is missing and *why*, is worth
+far more in an interview than any throughput claim.
+
+### What Flink has that Ripple does not
+
+| | Flink | Ripple |
+| --- | --- | --- |
+| Distributed execution | Yes — the entire point | Threads in one process |
+| State larger than RAM | RocksDB, incremental checkpoints | In-memory; checkpoint is O(all state) |
+| Exactly-once sinks | Two-phase commit | Idempotent upsert only |
+| Rescaling | Key groups + operator-state redistribution | Key groups; unkeyed operator state not redistributed |
+| Unaligned checkpoints | Yes | No |
+| Savepoints, schema evolution | Yes | No |
+| SQL / Table API / CEP / connectors | Yes | No |
+| Timers, ProcessFunction | Yes | No |
+| Watermark idleness detection | Yes | Known gap |
+
+### What the numbers actually say
+
+The engine costs ~47x a hand-written loop over an `unordered_map`. Component
+benchmarks account for only ~250ns of real work per record, so the rest is
+coordination: per-record queue handoffs, allocation, and a serialize/deserialize
+round trip on every state access.
+
+Design choices that deliberately cost throughput, each for a stated reason:
+serialization on every state access (backend swappability, D-038), `std::string`
+keys with an allocation per record, virtual dispatch per operator (runtime
+topology and traversal, D-014).
+
+### Why not benchmark against Flink directly
+
+A fair comparison needs identical hardware, workload, semantics **and durability
+guarantees**. Ripple checkpoints to memory and runs in-process; Flink checkpoints
+durably and serializes across a network even locally. A number showing Ripple
+winning would be comparing different things and would collapse under one
+follow-up question. An unfair benchmark is worse than no benchmark — the same
+principle as a green test that exercises nothing.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

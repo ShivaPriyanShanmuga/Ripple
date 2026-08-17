@@ -7,6 +7,7 @@
 #include <ripple/serialization.hpp>
 #include <ripple/sink.hpp>
 #include <ripple/source.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/timestamp.hpp>
 #include <ripple/watermark.hpp>
 #include <ripple/window.hpp>
@@ -549,7 +550,7 @@ TEST(WindowCheckpointTest, RoundTripsWindowContentsAndWatermark) {
         [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
         TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{}, Duration{5'000});
     ripple::ByteReader reader(writer.bytes());
-    restored->restore_state(reader);
+    restored->restore_state(reader, ripple::KeyGroupRange{0, ripple::kMaxKeyGroups});
     EXPECT_TRUE(reader.exhausted()) << "snapshot and restore disagree about the layout";
 
     EXPECT_EQ(restored->open_window_count(), original->open_window_count());
@@ -589,7 +590,7 @@ TEST(WindowCheckpointTest, RestoresTheWatermarkSoLateRecordsStayLate) {
         [](const Sale& sale) { return sale.region; }, [](const Sale& sale) { return sale.amount; },
         TumblingWindows{Duration{1'000}}, SumAggregator<std::int64_t>{});
     ripple::ByteReader reader(writer.bytes());
-    restored->restore_state(reader);
+    restored->restore_state(reader, ripple::KeyGroupRange{0, ripple::kMaxKeyGroups});
 
     KeyedResultCollector<std::string, std::int64_t> restored_out;
     restored->process(ripple::make_record(Sale{"north", 10}, ms(100)), restored_out);

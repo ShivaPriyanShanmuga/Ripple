@@ -4,6 +4,7 @@
 #include <ripple/operator.hpp>
 #include <ripple/record.hpp>
 #include <ripple/serialization.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/timestamp.hpp>
 #include <ripple/watermark.hpp>
 #include <ripple/window.hpp>
@@ -201,8 +202,15 @@ public:
         Serializer<Timestamp>::write(writer, current_watermark_);
     }
 
-    void restore_state(ByteReader& reader) override {
-        keyed_windows_.clear();
+    /// Additive and filtered by key group, which is what makes a windowed job
+    /// **rescalable**.
+    ///
+    /// Window state is keyed by the same key the shuffle partitions on, so it
+    /// redistributes exactly like backend state (D-062): each task reads every
+    /// old snapshot and keeps the groups it now owns. Without this, a rescaled
+    /// windowed job silently restarts every window from empty -- it does not
+    /// fail, it just under-reports, which is the same quiet failure D-066 was.
+    void restore_state(ByteReader& reader, KeyGroupRange range) override {
         const auto key_count = static_cast<std::size_t>(reader.read_fixed<std::uint32_t>());
         for (std::size_t i = 0; i < key_count; ++i) {
             KeyType key = Serializer<KeyType>::read(reader);
@@ -217,9 +225,17 @@ public:
                 const bool dirty = Serializer<bool>::read(reader);
                 windows.emplace(window, WindowState{std::move(accumulator), dirty});
             }
-            keyed_windows_.emplace(std::move(key), std::move(windows));
+            // Entries outside the range are still parsed -- the reader must
+            // advance past them -- and then dropped.
+            if (range.contains(key_group_of(serialize(key)))) {
+                keyed_windows_.emplace(std::move(key), std::move(windows));
+            }
         }
-        current_watermark_ = Serializer<Timestamp>::read(reader);
+        // Event-time progress belongs to the whole operator, not to any key, so
+        // it is taken from whichever snapshot advanced furthest. Taking the last
+        // one read would depend on blob ordering.
+        const Timestamp restored = Serializer<Timestamp>::read(reader);
+        current_watermark_ = std::max(current_watermark_, restored);
     }
 
     /// Attach a destination for records that arrive too late for any window.

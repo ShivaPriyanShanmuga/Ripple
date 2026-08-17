@@ -4,6 +4,7 @@
 #include <ripple/operator.hpp>
 #include <ripple/record.hpp>
 #include <ripple/serialization.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/watermark.hpp>
 
 #include <memory>
@@ -71,9 +72,9 @@ public:
         second_->snapshot_state(writer);
     }
 
-    void restore_state(ByteReader& reader) override {
-        first_->restore_state(reader);
-        second_->restore_state(reader);
+    void restore_state(ByteReader& reader, KeyGroupRange range) override {
+        first_->restore_state(reader, range);
+        second_->restore_state(reader, range);
     }
 
     [[nodiscard]] Operator<In, Mid>& first() noexcept { return *first_; }

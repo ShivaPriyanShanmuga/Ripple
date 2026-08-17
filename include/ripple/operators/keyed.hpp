@@ -4,6 +4,7 @@
 #include <ripple/operator.hpp>
 #include <ripple/record.hpp>
 #include <ripple/serialization.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/state/state_backend.hpp>
 #include <ripple/state/state_handles.hpp>
 #include <ripple/timestamp.hpp>
@@ -118,7 +119,7 @@ public:
     /// visible at the point someone would otherwise wonder.
     void snapshot_state(ByteWriter& /*writer*/) const override {}
 
-    void restore_state(ByteReader& /*reader*/) override {}
+    void restore_state(ByteReader& /*reader*/, KeyGroupRange /*range*/) override {}
 
 protected:
     // Reads the payload and lets the record go; there is nothing downstream to

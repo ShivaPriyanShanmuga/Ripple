@@ -1640,6 +1640,84 @@ against the limits of the timestamp type.
 
 ---
 
+### D-070 — Window state redistributes by key group too
+
+Found by writing the test that should have existed all along: a *windowed*
+parallel pipeline recovering across a rescale. It failed, and the failure was
+real -- a rescaled windowed job silently restarted every window from empty and
+under-reported, the same quiet failure as D-066.
+
+D-062 had said operator state cannot be redistributed on a rescale. That is true
+in general, and **false for window state specifically**, because window state is
+keyed by exactly the key the shuffle partitions on. So it redistributes by key
+group like backend state.
+
+`OperatorBase::restore_state` now takes a `KeyGroupRange`, and the pipeline
+offers **every** old snapshot to **every** subtask. An operator with keyed state
+keeps the groups it now owns and drops the rest, additively across calls; one
+with genuinely unkeyed state ignores the range and restores nothing on a rescale.
+That distinction is precisely why Flink separates keyed state from operator state
+with union-list and split-list redistribution.
+
+One detail worth stating: the restored watermark is the **maximum** across
+snapshots, not the last one read. Taking the last would make event-time progress
+depend on the order the blobs happened to be iterated in.
+
+**The blind spot this exposes, which is the more useful lesson:** every recovery
+test used a keyed aggregate, whose state lives in the backend. Not one exercised
+an operator holding its own state, so an entire category was untested while the
+suite looked thorough. *A test suite that exercises one kind of state proves
+nothing about the other kinds.*
+
+---
+
+### D-071 — Comparison against a baseline, not against Flink
+
+**Rejected: benchmarking against Flink.** A fair comparison needs identical
+hardware, workload, semantics **and durability guarantees** -- Ripple checkpoints
+to memory, Flink to durable storage; Ripple is in-process, Flink serializes
+across a network even locally. Any number showing Ripple "winning" would be
+comparing different things and would not survive one follow-up question. An
+unfair benchmark is worse than none.
+
+**Chosen: a hand-written loop over an `unordered_map`** doing the same
+aggregation with no engine at all.
+
+| | records/sec |
+| --- | --- |
+| No engine (hand-written loop) | ~34,000,000 |
+| Ripple, parallelism 4 | ~725,000 |
+
+**The engine costs roughly 47x a bare loop.** That is the honest headline, and it
+is the number that says where to look: the component benchmarks (D-068) sum to
+about 250ns of real work per record, so the overwhelming majority of the time is
+coordination -- per-record queue handoffs, allocation, and serialize/deserialize
+on every state access -- rather than the aggregation itself.
+
+The baseline provides none of event time, windowing, checkpointing, recovery,
+parallelism, or backpressure. It is a lower bound on cost, not an alternative.
+The 47x is what those properties cost as currently implemented, and the obvious
+first optimisation is batching across queues rather than one record per handoff
+-- which the 25x queue-capacity finding already pointed at.
+
+---
+
+### D-072 — Single benchmark runs are not measurements
+
+Checkpoint cost measured **3.5%** on one run and **-0.1%** on the next; unpaced
+throughput at parallelism 4 has ranged from 546k to 725k rec/s across runs.
+
+Same binary, same input, same machine. The variance is the machine -- a laptop
+under WSL2 with 8 threads, no CPU pinning, no isolation, thermal and scheduler
+noise. Any single number from this harness is indicative, not authoritative.
+
+Recorded rather than quietly averaged away, because quoting one run as a result
+is the same species of error as quoting a mean latency without its tail: it
+presents a distribution as a fact. The harness should repeat and report a
+distribution over runs, which is the obvious next improvement to it.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -1653,5 +1731,5 @@ against the limits of the timestamp type.
 | 6 | Parallelism, partitioning, backpressure | **Complete** — 115 tests, TSan-clean over repeated runs |
 | 7 | Checkpointing (Chandy-Lamport ABS) | **Complete** — 125 tests, alignment verified by disabling it |
 | 8 | Recovery and exactly-once | **Complete** — 139 tests, fault injection + rescaling via key groups |
-| 9 | Benchmarks and demo application | **Complete** — 144 tests, micro + end-to-end benchmarks, taxi demo |
+| 9 | Benchmarks and demo application | **Complete** — 146 tests, micro + end-to-end benchmarks, baseline comparison, taxi demo |
 | 10 | README | Not started |

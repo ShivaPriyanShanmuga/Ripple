@@ -36,6 +36,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -158,6 +159,37 @@ ThroughputResult measure_throughput(const std::vector<ripple::Record<Event>>& in
     return ThroughputResult{static_cast<double>(input.size()) / seconds, seconds};
 }
 
+/// A hand-written loop doing the same aggregation with no engine at all.
+///
+/// This is the honest comparison to make. Benchmarking against Flink would need
+/// identical hardware, workload, semantics *and durability guarantees* -- ours
+/// checkpoints to memory, Flink to durable storage -- so any number showing
+/// Ripple "winning" would be comparing different things and would not survive a
+/// single follow-up question.
+///
+/// What this measures instead is what the abstractions actually cost: operator
+/// dispatch, the collector indirection, serialize/deserialize on every state
+/// access, queue handoffs and the shuffle. That number is defensible, and it is
+/// the one that says where to look if the engine ever needs to be faster.
+///
+/// Note what the baseline does *not* provide, which is the whole point of the
+/// gap: no event-time semantics, no windowing, no checkpointing, no recovery, no
+/// parallelism, and no backpressure. It is a lower bound on cost, not an
+/// alternative.
+double measure_baseline(const std::vector<ripple::Record<Event>>& input) {
+    std::unordered_map<std::string, std::int64_t> totals;
+    const auto started = Clock::now();
+    for (const ripple::Record<Event>& record : input) {
+        totals[record.value.zone] += record.value.fare;
+    }
+    const auto elapsed = Clock::now() - started;
+    // Keeps the optimiser from deleting the loop entirely.
+    if (totals.empty()) {
+        std::printf("");
+    }
+    return static_cast<double>(input.size()) / std::chrono::duration<double>(elapsed).count();
+}
+
 void run_throughput_section(const std::vector<ripple::Record<Event>>& input) {
     std::printf("\n=== Throughput (source unpaced, %zu records) ===\n\n", input.size());
     std::printf("  %-14s %16s %12s\n", "parallelism", "records/sec", "seconds");
@@ -166,8 +198,18 @@ void run_throughput_section(const std::vector<ripple::Record<Event>>& input) {
         std::printf("  %-14zu %16.0f %12.3f\n", parallelism, result.records_per_second,
                     result.seconds);
     }
-    std::printf("\n  Note: scaling is bounded by key skew -- the generator is deliberately\n"
-                "  Zipf-skewed, so the hottest zone caps one subtask no matter the width.\n");
+    const double baseline = measure_baseline(input);
+    const auto engine = measure_throughput(input, 4, 0, nullptr);
+    std::printf("  %-14s %16.0f %12s\n", "no engine", baseline, "(baseline)");
+
+    std::printf("\n  The baseline is a hand-written loop over an unordered_map: no operators,\n"
+                "  no queues, no serialization, no event time, no checkpointing, no recovery,\n"
+                "  no backpressure. The engine costs %.1fx that at parallelism 4, which is\n"
+                "  what the abstractions buy and what they charge.\n",
+                baseline / engine.records_per_second);
+    std::printf("\n  Scaling is bounded by key skew -- the generator is deliberately\n"
+                "  Zipf-skewed, so the hottest zone caps one subtask no matter the width --\n"
+                "  and by oversubscription: at parallelism 8 the job wants 10 threads on 8.\n");
 }
 
 void run_latency_section(const std::vector<ripple::Record<Event>>& input) {
