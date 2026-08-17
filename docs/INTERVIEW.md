@@ -539,6 +539,69 @@ lesson in Stage 0 and the TSan-contention finding in Stage 5.)
 
 ---
 
+## Stage 8 — Recovery and exactly-once
+
+### The sentence to be able to say precisely
+
+> Exactly-once does not mean each record is delivered once. Records are re-sent
+> after a failure -- replay is how recovery works. It means the **effect on
+> state** is as if each record were processed exactly once.
+
+### The three requirements, and who owns each
+
+1. **Replayable source** — can be rewound to a position. A file or Kafka topic
+   can; a UDP socket cannot, and nothing the engine does recovers data that is
+   gone.
+2. **Consistent snapshots** — Stage 7. *The only part the engine owns.*
+3. **Idempotent or transactional sink** — otherwise a perfect engine still
+   double-counts in the outside world.
+
+### Concepts covered
+
+- **State and offset are one fact.** Restoring one without the other double-counts
+  or loses data, in opposite directions.
+- **Why parallelism cannot change across a restore**, and what key groups are for.
+- **Two-phase commit in sinks**: pre-commit on barrier, commit on
+  checkpoint-complete. Why upserting is not always available.
+- **Fault injection with a fixed seed** — a harness that cannot replay its own
+  failure is useless.
+- **A crash must not emit the end-of-stream watermark**, or it fires every open
+  window on the way out.
+
+### The demonstration worth describing
+
+Disabling state restore while leaving the source rewind produced final totals of
+**9 where the correct answer was 24** — exactly the pre-cut records dropped. The
+same technique as Stage 5 (TSan contention) and Stage 7 (alignment): break the
+property deliberately, confirm the check fails, restore.
+
+### Questions to be able to answer cold
+
+1. Define exactly-once precisely. What is it *not*?
+2. Your engine is perfect and your job still double-counts revenue in the
+   database. What went wrong?
+3. What must the source guarantee? What if it is a UDP socket?
+4. What must the sink guarantee, and what are the two ways to provide it?
+5. Why does two-phase commit show up in real sinks rather than just upserting?
+6. Why does a checkpoint store the source offset alongside the state? What breaks
+   if you restore one but not the other — in each direction?
+7. Can you restore a checkpoint into a job with different parallelism? Why not,
+   and how do real engines fix it?
+8. Your fault-injection harness passes. What would also make it pass if recovery
+   were broken?
+9. A crash happens before any checkpoint completes. What is the correct
+   behaviour?
+10. Why must a crash *not* emit the end-of-stream watermark?
+
+### Struggled with — revision list
+
+- **Unverified** — built without the comprehension gate. Questions 1, 2, 4 and 5
+  are the classic interview questions on this topic and should be answerable
+  instantly; 6 and 7 are the ones that show you built it rather than read about
+  it.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

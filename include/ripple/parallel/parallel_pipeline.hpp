@@ -81,6 +81,33 @@ struct ParallelConfig {
     std::size_t checkpoint_interval_records = 0;
 };
 
+/// Everything a run needs beyond its input, sink and coordinator.
+struct RunOptions {
+    /// Restore from this checkpoint instead of starting fresh. Each subtask's
+    /// state backend is repopulated from it and the source rewinds to its
+    /// offset.
+    ///
+    /// **The parallelism must match the run that produced the checkpoint.**
+    /// Subtask *i* restores task *i*'s snapshot, and hash partitioning sends a
+    /// key to `hash(key) % parallelism` -- change the parallelism and keys land
+    /// on subtasks holding somebody else's state. Real engines solve this with
+    /// key groups: a fixed number of hash buckets assigned to subtasks, so
+    /// rescaling redistributes buckets rather than rehashing keys. Out of scope
+    /// here, and the constraint is real rather than an oversight.
+    const CompletedCheckpoint* restore_from = nullptr;
+
+    /// Simulate a crash: stop emitting after this many records.
+    ///
+    /// Fidelity limit, stated plainly. All in-memory state is discarded (the
+    /// backends are destroyed when `run` returns), which is the part that
+    /// matters. What it does *not* simulate is losing records already in flight,
+    /// because terminating threads mid-operation is not something that can be
+    /// done safely in-process. That does not weaken the property under test:
+    /// recovery replays from the last completed checkpoint's offset, which
+    /// re-delivers exactly the records a graceful drain may have delivered.
+    std::optional<std::size_t> fail_after_records = std::nullopt;
+};
+
 struct ParallelMetrics {
     /// Records handled by each subtask. Wildly uneven entries mean **key skew**:
     /// hash partitioning sends every record for a key to one subtask, so a single
@@ -130,7 +157,7 @@ public:
     /// Runs to completion. If `coordinator` is non-null it must have been
     /// constructed with `parallelism + 1` tasks -- one per subtask, plus the sink.
     void run(std::vector<Record<In>> input, Sink<Out>& sink,
-             CheckpointCoordinator* coordinator = nullptr) {
+             CheckpointCoordinator* coordinator = nullptr, const RunOptions& options = {}) {
         const std::size_t parallelism = config_.parallelism;
 
         std::vector<std::unique_ptr<BoundedQueue<StreamElement<In>>>> input_queues;
@@ -154,6 +181,22 @@ public:
         for (std::size_t i = 0; i < parallelism; ++i) {
             backends.push_back(std::make_unique<MemoryStateBackend>());
             operators.push_back(make_operator_(i, *backends.back()));
+
+            if (options.restore_from == nullptr) {
+                continue;
+            }
+            const auto snapshot = options.restore_from->task_state.find(i);
+            if (snapshot == options.restore_from->task_state.end()) {
+                continue;
+            }
+            // Read in the same order `snapshot_and_acknowledge` wrote: backend
+            // first, then operator state. `deserialize`'s full-consumption rule
+            // (D-034) is what catches the two drifting apart -- silently, a
+            // mismatch here would restore plausible but wrong state, which is
+            // the worst possible outcome during a recovery.
+            ByteReader reader(snapshot->second);
+            backends[i]->restore_snapshot(reader);
+            operators[i]->restore_state(reader);
         }
 
         std::vector<std::size_t> records_per_subtask(parallelism, 0);
@@ -172,8 +215,22 @@ public:
             workers.spawn("sink", [&](const std::stop_token&) { sink_task.run(sink_queue, sink); });
 
             // --- source, on the calling thread -------------------------------
-            std::size_t offset = 0;
-            for (Record<In>& record : input) {
+            //
+            // Rewinding to the checkpoint's offset is what makes the source
+            // *replayable*, and it is half of end-to-end exactly-once. A source
+            // that cannot be rewound -- a UDP socket, say -- makes the property
+            // unachievable no matter how correct the engine is: the data is
+            // simply gone.
+            std::size_t offset =
+                options.restore_from != nullptr ? options.restore_from->source_offset : 0;
+            const std::size_t start = offset;
+
+            for (std::size_t index = start; index < input.size(); ++index) {
+                if (options.fail_after_records.has_value() &&
+                    offset >= *options.fail_after_records) {
+                    break;
+                }
+                Record<In>& record = input[index];
                 const std::size_t partition = key_hash_(record.value) % parallelism;
                 (void)input_queues[partition]->push(StreamElement<In>{0, std::move(record)});
                 ++offset;
@@ -195,8 +252,14 @@ public:
                 }
             }
 
-            for (auto& queue : input_queues) {
-                (void)queue->push(StreamElement<In>{0, kEndOfStreamWatermark});
+            // Announce end of stream only on a clean finish. A simulated crash
+            // must not tell downstream that time has advanced to infinity --
+            // that would fire every open window on the way out, which is exactly
+            // what a crash does not do.
+            if (!options.fail_after_records.has_value()) {
+                for (auto& queue : input_queues) {
+                    (void)queue->push(StreamElement<In>{0, kEndOfStreamWatermark});
+                }
             }
 
             // Shutdown in the order D-045 requires: close the queues so blocked

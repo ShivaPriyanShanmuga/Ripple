@@ -1296,6 +1296,102 @@ sloppiness that is not obviously wrong until another one names it.
 
 ---
 
+### D-059 — Recovery: state and source offset are one fact, restored together
+
+`RunOptions::restore_from` repopulates each subtask's state backend from the
+checkpoint **and** rewinds the source to the offset recorded in that same
+checkpoint.
+
+Doing one without the other is not a partial fix, it is a different bug in each
+direction:
+- restore state, start the source from zero → every record before the cut counted
+  twice;
+- rewind the source, start with empty state → everything before the cut lost.
+
+The second was confirmed by experiment. Disabling `restore_snapshot` while
+leaving the rewind produced final totals of **9 where the correct answer was 24**
+-- precisely the pre-cut records dropped. That is the third use in this project of
+"break the property, confirm the check fails, restore" (see also D-044 and
+D-056).
+
+Snapshots are read back in the same order they were written -- backend first,
+then operator state -- and `deserialize`'s full-consumption rule (D-034) is what
+catches the two drifting apart. A silent mismatch here would restore plausible
+but wrong state during a recovery, which is the worst possible moment for it.
+
+**Constraint worth stating:** the parallelism must match the run that produced
+the checkpoint. Subtask *i* restores task *i*'s snapshot, and hash partitioning
+sends a key to `hash(key) % parallelism` -- change the parallelism and keys land
+on subtasks holding somebody else's state. Real engines solve this with **key
+groups**: a fixed number of hash buckets assigned to subtasks, so rescaling
+redistributes buckets rather than rehashing keys. Out of scope here; recorded as
+a real limitation rather than an oversight.
+
+---
+
+### D-060 — What "exactly-once" actually means, and who has to provide it
+
+Exactly-once does **not** mean each record is delivered once. Records are
+absolutely re-sent after a failure -- replay is how recovery works. It means the
+**effect on state** is as if each record were processed exactly once.
+
+The end-to-end property needs three things, and the engine supplies only one:
+
+1. **A replayable source** -- one that can be rewound to a position. A file or a
+   Kafka topic can; a UDP socket cannot, and no amount of engine correctness
+   recovers data that is simply gone.
+2. **Consistent snapshots** -- Stage 7. *This is the only part the engine owns.*
+3. **An idempotent or transactional sink** -- otherwise a perfect engine still
+   double-counts in the outside world. Writing "$500 revenue for Midtown" twice
+   into a database that *adds* is a real error no checkpoint can undo.
+
+`DeliveryIsAtLeastOnceWhileTheEffectIsExactlyOnce` asserts both halves in one
+test, deliberately: the interesting claim is not "the answer is right", it is
+"the answer is right **despite** duplicate delivery". It checks that the sink
+genuinely received more writes than there were input records *and* that the final
+per-key totals match an uninterrupted run.
+
+`AnAppendingSinkWouldDoubleCount` is the negative control, and it is the more
+important of the two. Without it, correct results could simply mean no replay
+occurred, and the sink requirement would look like an unnecessary precaution.
+
+**Why two-phase commit appears in real sinks.** Upserting works when results are
+keyed and replacing is meaningful. When they are not -- appending rows, sending
+emails, charging cards -- the sink writes into an uncommitted transaction and
+commits only once the checkpoint containing those writes is confirmed complete.
+Pre-commit on barrier, commit on checkpoint-complete notification: the same two
+phases, driven by the checkpoint protocol.
+
+---
+
+### D-061 — The fault-injection harness, and its fidelity limit
+
+`fail_after_records` stops the source mid-stream; all in-memory state is then
+discarded when `run` returns, which is the part that matters. The harness kills
+the job at seeded pseudo-random offsets, recovers from whatever checkpoint had
+completed, resumes, and asserts the final state matches an uninterrupted run
+every time.
+
+Seeded deliberately: **a fault-injection harness that cannot replay its own
+failure is close to useless.**
+
+**What it does not simulate**, stated plainly rather than glossed: losing records
+already in flight, because terminating threads mid-operation cannot be done
+safely in-process. This does not weaken the property under test -- recovery
+replays from the last completed checkpoint's offset, which re-delivers exactly
+the records a graceful drain may have delivered.
+
+Cases covered on purpose: failure *before* any checkpoint completes (replay from
+the beginning is correct, not exceptional), failure immediately after one, and
+repeated failures where each recovery must start from the **newest** completed
+checkpoint rather than the first.
+
+A crash also does **not** emit the end-of-stream watermark. Announcing that time
+has advanced to infinity on the way out would fire every open window, which is
+exactly what a crash does not do.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -1308,6 +1404,6 @@ sloppiness that is not obviously wrong until another one names it.
 | 5 | Concurrency primitives | **Complete** — 106 tests, TSan-clean under contention |
 | 6 | Parallelism, partitioning, backpressure | **Complete** — 115 tests, TSan-clean over repeated runs |
 | 7 | Checkpointing (Chandy-Lamport ABS) | **Complete** — 125 tests, alignment verified by disabling it |
-| 8 | Recovery and exactly-once | Not started |
+| 8 | Recovery and exactly-once | **Complete** — 132 tests, fault injection at seeded random kill points |
 | 9 | Benchmarks and demo application | Not started |
 | 10 | README | Not started |
