@@ -349,6 +349,73 @@ author's request); they are the checklist for the revision pass.
 
 ---
 
+## Stage 5 — Concurrency primitives
+
+### Concepts covered
+
+- **Bounded queues as the backpressure mechanism.** Blocking on full is the
+  feature; an unbounded queue does not degrade more gracefully, it OOM-kills the
+  process under exactly the load where you needed it to survive.
+- **Why `wait` needs a predicate** — spurious wakeups *and* stolen wakeups, which
+  are different problems.
+- **The lost-wakeup bug** — why the flag must be mutated under the lock, and why
+  notifying outside the lock is fine.
+- **Two condition variables vs one**, and `notify_one` vs `notify_all`.
+- **`stop_token` is cooperative and wakes nothing**, so shutdown is close-then-
+  stop-then-join, in that order.
+- **`jthread` vs `thread`** — `terminate()` on a joinable destructor, and RAII
+  thread lifetime.
+- **Exception escape from a thread entry point** calls `std::terminate`.
+- **Member destruction order** as a correctness tool.
+- **Draining in-flight work**: close must not discard queued items.
+- **The limits of ThreadSanitizer** — see below; this is the important one.
+
+### The finding worth telling an interviewer about
+
+Removing the lock from `close()` left **every timing-based test green under
+TSan**. The tests sleep 150 ms before closing, so the consumer is parked in
+`wait` long before the writer runs, and TSan only reports a race while it still
+holds the earlier access in its shadow history.
+
+A test that hammers `close()` against concurrent `pop()` with no sleeps caught it
+instantly. That test is now in the suite and was verified to fail with the bug
+and pass with the fix.
+
+**Generalisation:** a green TSan run over tests that never actually contend
+proves nothing. This is the same shape as the Stage 0 lesson about recovering
+UBSan — a check that can pass while the property it protects is violated is worse
+than no check.
+
+### Questions to be able to answer cold
+
+1. Why does a bounded queue give you backpressure for free? Trace it from a slow
+   sink back to the source.
+2. What actually goes wrong with an unbounded queue? Be specific about the
+   failure mode and when it occurs.
+3. Give the two independent reasons `wait` takes a predicate. (Most people know
+   one.)
+4. Walk through the lost-wakeup bug step by step. Why does holding the mutex
+   while setting the flag fix it?
+5. Why two condition variables rather than one? When must you use `notify_all`?
+6. You call `request_stop()` on a worker blocked in `queue.pop()`. What happens,
+   and why?
+7. What is the correct shutdown sequence for a multi-stage pipeline, and what
+   breaks if you get the order wrong?
+8. Why `jthread` over `thread`? What does `thread`'s destructor do?
+9. Your concurrency test suite is green under TSan. What does that actually tell
+   you, and what does it not?
+10. Why does `close()` still hand out already-queued items instead of discarding
+    them?
+
+### Struggled with — revision list
+
+- **Unverified** — built without the comprehension gate. Questions 3, 4, 6, 7 and
+  9 are the highest-value: 3 and 4 are standard concurrency interview material,
+  and 6, 7 and 9 are the ones that come from having actually debugged this rather
+  than read about it.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

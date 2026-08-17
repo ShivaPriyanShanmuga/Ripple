@@ -11,7 +11,7 @@ function(ripple_add_test name)
             GTest::gtest_main
             Threads::Threads
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES TIMEOUT 60)
 endfunction()
 
 ripple_add_test(scaffolding_test)
@@ -22,3 +22,5 @@ ripple_add_test(watermark_test)
 ripple_add_test(window_test)
 ripple_add_test(serialization_test)
 ripple_add_test(state_test)
+ripple_add_test(bounded_queue_test)
+ripple_add_test(worker_group_test)

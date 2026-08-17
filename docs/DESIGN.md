@@ -879,6 +879,150 @@ do when the demo application is built.
 
 ---
 
+### D-041 — `BoundedQueue`: the backpressure primitive
+
+**Chosen:** mutex + two condition variables + `std::deque`, fixed capacity,
+blocking `push`/`pop`, plus a `close()` that wakes everyone.
+
+**Two condition variables, not one.** With a single variable a producer freeing a
+slot cannot tell whether the waiters are producers or consumers, so it must
+`notify_all` -- waking every blocked thread so that one can proceed. Two
+variables let each notification reach only threads that can act on it.
+
+**`notify_one` on the normal path, `notify_all` on close.** One item became
+available, so one consumer can progress; waking the rest is a thundering herd
+that costs context switches and buys nothing. `close()` is the exception --
+every waiter must learn the stream is over.
+
+**Rejected — a lock-free queue.** Genuinely faster under contention, and the
+wrong tool: we *want* to block, because blocking is the backpressure. A lock-free
+queue would also be unbounded or spin, and would be far harder to prove correct.
+Wrong instinct for a throughput system; right one for the order-book project.
+
+---
+
+### D-042 — Why `wait` takes a predicate
+
+Two independent reasons, and knowing only one produces code that is wrong in the
+other case:
+
+1. **Spurious wakeups.** `wait` may return with no notification at all -- the
+   standard permits it because preventing it costs more on some platforms than
+   re-checking does.
+2. **Stolen wakeups.** Even a genuine notification proves nothing by the time
+   the woken thread runs: between the notifier releasing the lock and this
+   thread reacquiring it, another consumer can take the slot. The condition was
+   true when signalled and false on arrival.
+
+The predicate overload is `while (!pred()) wait(lock);`, which handles both by
+construction.
+
+---
+
+### D-043 — `close()` sets its flag under the lock: the lost-wakeup bug
+
+`cv.wait(lock, pred)` holds the mutex while `pred()` runs, then *atomically*
+releases the mutex and enqueues the thread on the condition variable — atomic
+with respect to the mutex, so a thread that also takes the mutex cannot slip
+between those steps.
+
+Set `closed_ = true` **without** the lock and it can. A consumer evaluates the
+predicate, reads `closed_ == false`, and decides to sleep; `close()` then sets
+the flag and calls `notify_all()` before the consumer has enqueued itself; the
+consumer enqueues and sleeps forever, having missed the only notification it was
+ever going to get. The program hangs at shutdown — intermittently, under load,
+usually not on the machine you tested on.
+
+Notifying *outside* the lock is fine and marginally cheaper: a thread woken while
+the notifier still holds the mutex would only block again on acquiring it.
+
+---
+
+### D-044 — TSan only catches a race between accesses that genuinely overlap
+
+Verified experimentally rather than assumed, and the most useful thing learned in
+this stage.
+
+The lock was removed from `close()` and the suite re-run under ThreadSanitizer.
+**Every timing-based test still passed.** They sleep 150 ms before closing, so the
+consumer is parked inside `wait` long before the writer runs; TSan reports a race
+only while it still holds the earlier access in its shadow history, and a gap
+that large evicts it.
+
+A probe hammering `close()` against concurrent `pop()`/`is_closed()` with no
+sleeps reported it immediately:
+
+```
+WARNING: ThreadSanitizer: data race
+  Write of size 1 by thread T2:                             <- close(), unlocked
+  Previous read of size 1 by thread T1 (mutexes: write M0): <- predicate, locked
+SUMMARY: ... bounded_queue.hpp:141 in BoundedQueue<int>::close()
+```
+
+`CloseIsSafeAgainstConcurrentPopsAndObservers` was added to the suite as a
+result, and confirmed to fail with the bug and pass with the fix.
+
+**The generalisation, which is the point:** a green TSan run over tests that never
+actually contend proves nothing. Concurrency tests must create genuine overlap,
+not merely involve more than one thread. This is the same theme as D-004 (UBSan
+that recovers) and the Stage 0 quiz: *a check that can pass while the property it
+protects is violated is worse than no check*, because it converts acknowledged
+ignorance into confident wrongness.
+
+---
+
+### D-045 — Shutdown is two steps, and a stop request is not one of them
+
+`std::stop_token` is **cooperative**: it sets a flag and runs callbacks. It
+interrupts nothing. A worker blocked inside `std::condition_variable::wait` --
+which is where `BoundedQueue::pop()` puts it -- knows nothing about stop tokens
+and will sit there forever regardless of how many times `request_stop()` is
+called.
+
+Correct shutdown, in order:
+1. **close the queues**, which wakes every blocked producer and consumer;
+2. **request stop and join**, which `WorkerGroup`'s destructor does.
+
+Do only the second and the pipeline hangs. This is the single most common
+multi-stage-pipeline shutdown failure, and
+`WorkerGroupTest.StopRequestAloneDoesNotWakeAWorkerBlockedOnAQueue` asserts the
+trap **directly** — it verifies that a stop request does *not* wake the worker.
+That is the contract, not a defect being tolerated, and encoding it stops
+someone later "fixing" shutdown by adding another `request_stop()`.
+
+**Rejected — `std::condition_variable_any` with its stop-token-aware `wait`.** It
+would collapse the two steps into one. It works with any lockable rather than
+only `unique_lock<mutex>` and pays for that generality on every wait, and
+closing the queue is the more honest model anyway: "this stream is finished" is
+information the queue has, not the thread.
+
+Every test target now carries a CTest `TIMEOUT` of 60s, so a shutdown regression
+fails the build instead of hanging CI forever.
+
+---
+
+### D-046 — `std::jthread` and RAII thread lifetime
+
+`std::thread`'s destructor calls `std::terminate()` if the thread is still
+joinable, making every `std::thread` a hand-written `join()` on *every* exit path
+including the exception path -- and the one that gets forgotten kills the
+process. `std::jthread` requests a stop and joins in its own destructor, so
+correct shutdown is the default rather than a discipline.
+
+`WorkerGroup` is therefore mostly `std::vector<std::jthread>`. What it adds:
+
+- **Exception capture.** An exception escaping a thread's entry point calls
+  `std::terminate` -- the process dies with a stack trace from the wrong thread
+  and no indication of which worker failed. Catching at the boundary turns that
+  into a recorded `WorkerFailure`.
+- **Member ordering.** `workers_` is declared *last* so it is destroyed *first*
+  (reverse declaration order), guaranteeing the jthreads join before the failure
+  list and its mutex are gone. The explicit `join()` in the destructor body
+  already ensures this; the ordering means the class stays sound if that line is
+  ever removed.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -888,7 +1032,7 @@ do when the demo application is built.
 | 2 | Event time and watermarks | **Complete** — 32 tests, clean under dev/gcc/asan/tsan |
 | 3 | Windowing | **Complete** — 53 tests, clean under dev/gcc/asan/tsan |
 | 4 | Keyed state, backend, serialization | **Complete** — 84 tests, clean under dev/gcc/asan/tsan |
-| 5 | Concurrency primitives | Not started |
+| 5 | Concurrency primitives | **Complete** — 106 tests, TSan-clean under contention |
 | 6 | Parallelism, partitioning, backpressure | Not started |
 | 7 | Checkpointing (Chandy-Lamport ABS) | Not started |
 | 8 | Recovery and exactly-once | Not started |
