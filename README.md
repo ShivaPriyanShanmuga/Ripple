@@ -118,7 +118,7 @@ That seam is why making the engine parallel changed **no operator code at all**.
 
 ## Design decisions
 
-All 72 are in [`docs/DESIGN.md`](docs/DESIGN.md) with their rejected
+All 74 are in [`docs/DESIGN.md`](docs/DESIGN.md) with their rejected
 alternatives. The ones that shaped everything else:
 
 ### Type erasure: virtual base for ownership, static types on the edges
