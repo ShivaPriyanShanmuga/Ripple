@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run; there is no value in
+# finishing CI for a commit that has already been superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and test under every configuration.
+  #
+  # fail-fast is off deliberately: if the asan job fails we still want to know
+  # whether tsan also failed. One red job hiding three others wastes a cycle.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [dev, dev-gcc, asan, tsan]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang clang-tidy g++
+
+      # Ubuntu 24.04 ships vm.mmap_rnd_bits=32. ThreadSanitizer's shadow memory
+      # layout assumes fewer bits of ASLR entropy than that, and aborts at
+      # startup with "FATAL: ThreadSanitizer: unexpected memory mapping" -- which
+      # looks like a broken build rather than a host configuration issue.
+      - name: Relax ASLR entropy for ThreadSanitizer
+        if: matrix.preset == 'tsan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DRIPPLE_WERROR=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  # ---------------------------------------------------------------------------
+  # Formatting and linting, split into its own job so it reports independently
+  # and finishes in seconds rather than waiting behind four compiles.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: format + tidy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang clang-tidy clang-format
+
+      - name: Check formatting
+        run: |
+          find include src tests -type f \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null \
+            | xargs --no-run-if-empty clang-format --dry-run --Werror
+
+      # clang-tidy needs compile_commands.json, so it needs a configured build
+      # tree. Configuring is enough -- no compilation required.
+      - name: Configure for compile_commands.json
+        run: cmake --preset dev
+
+      - name: Run clang-tidy
+        run: |
+          find include src tests -type f -name '*.cpp' 2>/dev/null \
+            | xargs --no-run-if-empty clang-tidy -p build/dev --warnings-as-errors='*'

@@ -1,0 +1,10 @@
+build/
+.cache/
+compile_commands.json
+
+# Demo dataset (Stage 9): raw downloads are large; only a sampled slice is committed.
+data/raw/
+
+*.o
+*.a
+perf.data*

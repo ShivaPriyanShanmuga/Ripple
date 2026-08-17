@@ -1,0 +1,51 @@
+---
+# Curated, not maximal. A tidy config that fires on everything trains you to
+# ignore tidy, at which point it protects nothing. Every disabled check below
+# is disabled for a stated reason.
+Checks: >
+  -*,
+  bugprone-*,
+  concurrency-*,
+  performance-*,
+  modernize-*,
+  cppcoreguidelines-*,
+  readability-*,
+  misc-*,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-identifier-length,
+  -bugprone-easily-swappable-parameters,
+  -readability-function-cognitive-complexity,
+  -misc-non-private-member-variables-in-classes,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-avoid-const-or-ref-data-members,
+  -modernize-return-braced-init-list,
+  -readability-redundant-member-init
+
+# Rationale for the exclusions:
+#   modernize-use-trailing-return-type ......... pure style, and it fires on every function
+#   *-magic-numbers ............................ tests are full of intentional literals
+#   readability-identifier-length .............. rejects `i`, `t`, `id`
+#   bugprone-easily-swappable-parameters ....... fires on (start, end) time ranges everywhere
+#   readability-function-cognitive-complexity .. will fire on window/checkpoint logic that is
+#                                                genuinely complex rather than badly written
+#   *-non-private-member-variables-in-classes .. fires on plain aggregate structs like Record
+#   avoid-const-or-ref-data-members ............ we will hold const config members deliberately
+#   modernize-return-braced-init-list .......... `return Type(args)` is clearer than `return {args}`
+#                                                where the returned type is not obvious from context
+#   readability-redundant-member-init .......... explicit `{}` documents that a member is
+#                                                deliberately zero-initialized, and survives a later
+#                                                change to the member's own default constructor
+
+# Only lint our own headers. Without this, tidy walks into GoogleTest and the
+# standard library and reports thousands of findings we cannot act on.
+HeaderFilterRegex: '.*/(include/ripple|src|tests)/.*'
+
+# Left empty deliberately: CI passes --warnings-as-errors so local iteration
+# stays fast while the pipeline stays strict.
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: '0'

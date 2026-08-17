@@ -1,0 +1,39 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# `Type* name` rather than `Type *name`: pointer-ness belongs to the type.
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: Yes
+BreakBeforeBraces: Attach
+FixNamespaceComments: true
+NamespaceIndentation: None
+SeparateDefinitionBlocks: Always
+SpaceAfterTemplateKeyword: false
+
+# Group includes so that the header a .cpp implements comes first, then our
+# own headers, then third-party, then the standard library. Makes a missing
+# transitive include in one of our headers show up as a compile error.
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+IncludeCategories:
+  - Regex: '^<ripple/'
+    Priority: 2
+  - Regex: '^<gtest/|^<gmock/|^<benchmark/'
+    Priority: 3
+  - Regex: '^<.*\.h>'
+    Priority: 4
+  - Regex: '^<.*>'
+    Priority: 5
+  - Regex: '.*'
+    Priority: 1
