@@ -588,6 +588,132 @@ makes it diagnosable in production.
 
 ---
 
+### D-027 — Windows are half-open intervals `[start, end)`
+
+**Rejected:** inclusive ends. A record landing exactly on a boundary would
+belong to two adjacent tumbling windows and be counted twice. The error appears
+only at boundaries, so it survives any test that does not deliberately probe
+them, and it inflates totals by a small, plausible-looking amount.
+
+Related: `TimeWindow::overlaps` tests **strict** overlap, not adjacency.
+`[1000,2000)` meeting `[2000,3000)` is precisely the case where a session's
+inactivity gap was met exactly and the session must end. Treating adjacency as
+overlap would silently glue every session in the stream into one.
+
+---
+
+### D-028 — Assigners are template parameters, not a virtual interface
+
+**Chosen:** `TumblingWindows`, `SlidingWindows`, `SessionWindows` as small value
+types passed as template arguments to `WindowOperator`.
+
+**Rejected:** a `WindowAssigner` abstract base with virtual `assign`.
+
+**Rationale.** Assignment is pure arithmetic, called once per record, and --
+unlike the operator graph -- the set of assigners does not need to be extensible
+at runtime from configuration. There is no indirection to buy anything here.
+
+Each assigner exposes `static constexpr bool is_merging`, which lets the window
+operator `if constexpr` the entire merge machinery out of existence for the
+non-merging cases. A virtual interface could not do that.
+
+*Note the contrast with D-014: virtual dispatch was accepted for operators
+because the topology must be runtime-constructible and traversable. Neither
+applies to assigners. The rule is not "virtual is fine" or "templates are fast",
+it is "erase where you need runtime variation, and only there".*
+
+---
+
+### D-029 — Windows hold one accumulator, not their records
+
+**Chosen:** an aggregator interface (`create` / `add` / `result` / `merge`) that
+folds each record into an accumulator as it arrives.
+
+**Rejected:** buffering every record in a window and aggregating at fire time.
+
+**Rationale.** A summing window holds 8 bytes instead of the whole window's
+worth of data. That is the difference between a windowed job that runs
+indefinitely and one that grows until it is killed. `CollectAggregator` exists
+for cases genuinely needing raw contents, and its docstring says plainly that it
+forfeits this property.
+
+Duck-typed template parameter rather than a virtual interface, for the same
+reason as D-028: `add` is the hottest call in a windowed pipeline and there is
+no runtime-pluggability requirement.
+
+---
+
+### D-030 — Only session windows merge, and merging constrains the aggregator
+
+Tumbling and sliding boundaries are fixed by arithmetic on the timestamp alone;
+no record can move them. A session's boundaries are determined by the data, so a
+record arriving between two existing sessions **proves there was never a gap
+between them** -- and the two sessions were never really two.
+
+**Consequence:** merging assigners require the aggregator to supply `merge`,
+which forces the aggregation to be associative. That is a real constraint and it
+is the reason merging is exposed as a property of the assigner rather than
+assumed everywhere.
+
+**Algorithm.** Windows live in a `std::map` ordered by start, and merging scans
+only *adjacent* entries. That is sufficient: if window A overlapped a
+non-adjacent window C, it would necessarily also overlap everything between
+them. After a merge the scan resumes from the merged window rather than moving
+on, because the merged window may now reach far enough to overlap the next one.
+
+---
+
+### D-031 — Allowed lateness re-fires windows; downstream must treat results as upserts
+
+A window fires when the watermark passes its end, but its state is retained
+until `end + allowed_lateness`. A record arriving in that interval is admitted,
+marks the window dirty, and the window emits **again** with a corrected result.
+
+**The consequence downstream, which is easy to miss:** with allowed lateness the
+same window is emitted more than once. A sink must treat window results as
+upserts keyed by the window, not as appends. This is the same idempotence
+requirement Stage 8 needs for end-to-end exactly-once, arriving three stages
+early.
+
+Records that missed every window go to a **side output** rather than being
+dropped, and are counted even when no handler is attached. Late data is a
+symptom -- of a watermark bound set too tight, or a misbehaving upstream -- and
+data that vanishes without a trace is indistinguishable from data that was never
+sent.
+
+---
+
+### D-032 — Window assignment uses floor division
+
+C++ integer division truncates toward zero: `-1 / 5000` is `0`, not `-1`. A
+truncating implementation therefore assigns every pre-epoch timestamp to the
+window starting at zero.
+
+Not hypothetical. The demo dataset contains meter timestamps stamped in 1900 and
+2098, which is one of the reasons it was chosen (D-013) -- a synthetic generator
+would never have produced this bug.
+
+---
+
+### D-033 — Window results are stamped at `end - 1ms`, and emitted before the watermark
+
+A window's output record carries the last instant the window covers, not its
+exclusive end. Stamping at `end` would place the result in the *next* window if
+it flowed into a second windowing operator -- an off-by-one shifting every
+downstream aggregate by exactly one window.
+
+`on_watermark` emits all results **before** forwarding the watermark, for the
+same reason as D-023: results carry timestamps inside the window they came from
+and must reach downstream before the watermark that would render them late.
+
+**And it must forward the watermark at all.** An override that fires windows and
+swallows the watermark freezes event time for the entire rest of the pipeline:
+downstream windows never fire, never free state, and the job produces no output
+while looking perfectly healthy. `WindowOperatorTest.ForwardsWatermarksDownstream`
+exists solely to catch that.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -595,7 +721,7 @@ makes it diagnosable in production.
 | 0 | Scaffolding, sanitizers, CI | **Complete** |
 | 1 | Core dataflow, type erasure | **Complete** — 21 tests, clean under dev/gcc/asan/tsan |
 | 2 | Event time and watermarks | **Complete** — 32 tests, clean under dev/gcc/asan/tsan |
-| 3 | Windowing | Not started |
+| 3 | Windowing | **Complete** — 53 tests, clean under dev/gcc/asan/tsan |
 | 4 | Keyed state, backend, serialization | Not started |
 | 5 | Concurrency primitives | Not started |
 | 6 | Parallelism, partitioning, backpressure | Not started |

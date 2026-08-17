@@ -229,6 +229,64 @@ author's request); they are the checklist for the revision pass.
 
 ---
 
+## Stage 3 — Windowing
+
+### Concepts covered
+
+- **What "the window fires" means mechanically.** Records fold into
+  accumulators; a watermark proves a window complete; the accumulator becomes a
+  result; the state is deleted. **Firing is how a windowed job reclaims memory** —
+  which is why a stalled watermark does not merely stop output, it grows the
+  process until it dies.
+- **Half-open intervals.** Why `[start, end)` and not inclusive ends.
+- **One record in many windows.** Sliding windows place each record in
+  `ceil(size/slide)` accumulators simultaneously. That multiple is the memory
+  cost — a one-hour window sliding every second holds every record 3,600 times.
+- **Why only sessions merge.** Tumbling/sliding boundaries are fixed by
+  arithmetic; session boundaries are determined by the data, so a bridging record
+  proves two sessions were never two. Merging forces the aggregator to be
+  associative.
+- **The adjacency/overlap boundary.** A gap of exactly the session gap must NOT
+  merge; that is the definition of the session ending.
+- **Incremental aggregation vs. buffering.** One accumulator per window rather
+  than every record.
+- **Allowed lateness and the re-fire.** The same window emitted twice, and the
+  upsert requirement it imposes on sinks — the same idempotence Stage 8 needs.
+- **Side output for late data.** Why counting and routing beats silent dropping.
+- **Floor vs. truncating division** in window assignment, and why pre-epoch
+  timestamps expose it.
+- **When to erase a type and when not to.** Virtual for operators (runtime
+  topology, traversal); templates for assigners and aggregators (neither
+  applies). The rule is not "virtual is fine", it is "erase only where runtime
+  variation is required".
+
+### Questions to be able to answer cold
+
+1. Walk through what happens, step by step, from a record arriving to its
+   window's result being emitted and its memory freed.
+2. Why must windows be half-open? Give the concrete failure with inclusive ends.
+3. A one-hour sliding window with a one-second slide. How many windows does one
+   record land in, and what does that do to memory?
+4. Why do session windows need merging logic when tumbling and sliding do not?
+5. Why does a merging assigner force the aggregator to be associative?
+6. Two sessions with a 30s gap setting, separated by exactly 30s. Merge or not?
+   Why is that the right answer?
+7. With allowed lateness configured, a downstream sink receives the same window
+   twice with different values. Is that a bug? What must the sink do?
+8. A window operator fires its windows on watermark and forgets to forward the
+   watermark. Describe the symptom an operator would see in production.
+9. Why is a window's result stamped at `end - 1ms` rather than `end`?
+10. Your windowed job's memory grows without bound but output looks correct so
+    far. What is your first hypothesis?
+
+### Struggled with — revision list
+
+- **Unverified** — built without the comprehension gate. Questions 1, 4, 5, and 8
+  are the ones most likely to come up in an interview and least likely to be
+  answerable from having merely read the code.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview
