@@ -1732,4 +1732,7 @@ distribution over runs, which is the obvious next improvement to it.
 | 7 | Checkpointing (Chandy-Lamport ABS) | **Complete** — 125 tests, alignment verified by disabling it |
 | 8 | Recovery and exactly-once | **Complete** — 139 tests, fault injection + rescaling via key groups |
 | 9 | Benchmarks and demo application | **Complete** — 146 tests, micro + end-to-end benchmarks, baseline comparison, taxi demo |
-| 10 | README | Not started |
+
+All stages complete. The README is the entry point; this file is the decision
+record behind it.
+| 10 | README | **Complete** |
