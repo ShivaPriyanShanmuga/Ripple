@@ -2,6 +2,7 @@
 
 #include <ripple/collector.hpp>
 #include <ripple/record.hpp>
+#include <ripple/serialization.hpp>
 #include <ripple/watermark.hpp>
 
 #include <string_view>
@@ -30,6 +31,28 @@ public:
 
     /// Used in diagnostics and, from Stage 6, in instrumentation output.
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+
+    /// ## Operator state, designed here for Stage 7
+    ///
+    /// Whatever this operator holds that must survive a failure. Distinct from
+    /// the *keyed* state in `StateBackend`: this is the per-operator kind -- a
+    /// source's read offset, a window operator's open windows, a watermark
+    /// generator's high-water mark.
+    ///
+    /// Defaulted to no-ops because most operators are stateless. Map and filter
+    /// hold nothing between records and so need to say nothing about
+    /// checkpointing; only operators with something to lose implement these.
+    ///
+    /// Stage 7 adds barriers, alignment, and a coordinator that *call* these.
+    /// It does not change them, which is the whole point of defining them now:
+    /// retrofitting a state interface across every operator once checkpointing
+    /// exists is the expensive version of this work.
+    virtual void snapshot_state(ByteWriter& /*writer*/) const {}
+
+    /// Must restore exactly what `snapshot_state` wrote. The two are a matched
+    /// pair, and `deserialize`'s full-consumption check is what catches them
+    /// drifting apart.
+    virtual void restore_state(ByteReader& /*reader*/) {}
 };
 
 /// A transformation from `Record<In>` to zero or more `Record<Out>`.

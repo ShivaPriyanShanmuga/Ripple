@@ -714,6 +714,171 @@ exists solely to catch that.
 
 ---
 
+### D-034 — Serialization by trait specialisation, with a full-consumption check
+
+C++ has no reflection. Nothing can generate this for us, so every
+object-to-bytes conversion is written by hand. That is why it is a design task
+here and a library call in Flink.
+
+**Chosen:** `Serializer<T>` specialised per type with a `write` and a `read`,
+constrained by a `Serializable` concept. Built-ins for arithmetic types,
+`bool`, `std::string`, `std::vector`, `std::optional`, `std::pair`, raw byte
+blobs, `Timestamp` and `TimeWindow`.
+
+**Rejected — a self-describing tagged format** (protobuf/msgpack style). It buys
+schema evolution across versions, which we do not need since both ends of every
+conversion are compiled together, and charges for it on every field of every
+record.
+
+**Rejected — macro-generated field visitors** (`RIPPLE_FIELDS(a, b, c)`). It
+would remove the duplication between `write` and `read`, which is a real
+benefit. Rejected because macro-generated code is invisible to a debugger and
+produces errors naming the macro rather than the mistake.
+
+**The risk that rejection leaves, and how it is closed.** Writing three fields
+while reading two is *the* hand-rolled-serialization bug: it corrupts everything
+after it in the stream and is noticed, if at all, as inexplicably wrong data far
+from the cause. `deserialize` therefore requires the reader to be **fully
+consumed** and throws otherwise, converting that entire bug class into an
+exception at the point of the mistake. A truncated stream and an implausible
+length prefix throw for the same reason -- corrupt state must fail loudly,
+because restore happens exactly when you are already recovering from something
+else.
+
+---
+
+### D-035 — Fixed-width little-endian encoding
+
+Integers are written little-endian regardless of host byte order, and `bool` as
+exactly one byte rather than `sizeof(bool)`.
+
+Native order is marginally faster and works perfectly until a state file written
+on one machine is restored on another with the opposite endianness, at which
+point every integer is silently wrong -- not corrupt-looking, just wrong. The
+cost is a branch that compiles away on every platform anyone uses.
+
+**Rejected — varint lengths.** Smaller for the common short case, at the cost of
+a branchy decode; four bytes per string is not what limits this system.
+
+Asserted directly on the bytes in `EncodesIntegersLittleEndian`, because on a
+little-endian development machine the correct and buggy versions are
+indistinguishable by round trip.
+
+---
+
+### D-036 — Keys are stored as bytes, which is why serialization comes first
+
+`StateBackend` is a non-template class and its keys are `std::vector<std::byte>`.
+That is what lets one backend implementation serve operators keyed on any type --
+the same erasure argument as D-014, applied to state instead of operators.
+
+It is also the concrete reason serialization had to be designed before keyed
+state rather than alongside checkpointing: without it there is no key-type-
+agnostic backend at all.
+
+---
+
+### D-037 — Both levels of the backend are ordered maps, not hash maps
+
+A deliberate trade of some lookup speed for a property checkpointing needs:
+**iteration order is deterministic**, so snapshotting identical state twice
+produces identical bytes. An `unordered_map`'s iteration order depends on
+insertion history and bucket count, and without byte-stability checkpoints can
+never be compared, deduplicated, or diffed when something goes wrong.
+
+The inner map uses `std::less<>` so a `string_view` state name is a
+heterogeneous lookup rather than materialising a temporary `std::string` on
+every state read.
+
+Separately: `remove` drops a key entirely once its last state is gone. Without
+that, clearing state frees the values but leaks one empty map node per key
+forever -- a leak proportional to key cardinality, which for something like a
+user id is unbounded, and the classic way a keyed streaming job dies slowly.
+
+---
+
+### D-038 — State handles are views; `KeyedOperator::process` is `final`
+
+A handle owns nothing: it holds a backend reference and a state name, and every
+operation applies to whatever key is currently set. A handle has **no way to name
+a key**, so touching another key's state is not a mistake one can make.
+
+`KeyedOperator::process` is `final` and subclasses override `process_keyed`. The
+base sets the current key first, so a subclass cannot forget to. Were `process`
+overridable, the failure mode would be an operator reading state under whichever
+key was current from the *previous* record -- plausible, wrong, non-deterministic
+results that no type would catch.
+
+**Why this removes locking rather than optimising it.** Partitioning guarantees
+one processor per key, so keyed state has no shared resource to protect. The
+alternative -- one map behind a mutex, contended by every thread on every record
+-- does not merely run slower, it fails to scale, because contention grows with
+thread count. Real engines partition rather than lock for exactly this reason.
+
+**Accepted cost:** a serialize/deserialize round trip on every state access. Pure
+overhead against a plain `std::map<Key, T>` for the in-memory case, and what
+makes the backend swappable and lets Stage 7 snapshot state whose type it knows
+nothing about.
+
+---
+
+### D-039 — The file backend batches; it does not write through
+
+**Rejected — writing to the file on every `put`.** That turns a per-record
+operation into a syscall and a disk flush. A pipeline at 100k records/sec would
+issue 100k fsyncs/sec and manage a few hundred. It is not a slow implementation
+of the right idea, it is the wrong idea.
+
+**Chosen:** reads and writes hit memory; `flush()` persists everything at once.
+This is the same shape real engines use and is exactly what makes it compatible
+with checkpointing, which is already a "persist at a consistent point" operation.
+
+`flush()` writes to a temporary and renames over the target. `rename` within a
+filesystem is atomic, so a crash mid-flush leaves the previous complete file
+rather than a truncated one -- and a truncated state file is far worse than a
+stale one, because it fails at restore time.
+
+**What production would do differently:** rewriting all state per flush is
+O(total state), fine for a checkpoint every few seconds and hopeless for large
+state. RocksDB -- what Flink uses -- is an LSM tree, so a checkpoint costs
+O(changed state). Out of scope, and notably **the interface would not need to
+change** to accommodate it.
+
+---
+
+### D-040 — `snapshot_state` / `restore_state` on `OperatorBase`, defaulted to no-ops
+
+The stage brief asked to design an interface for a future requirement without
+building it. Two kinds of state exist and they need different homes:
+
+- **Keyed state** — partitioned by key, lives in `StateBackend`, and in Stage 6
+  partitions across threads alongside the records.
+- **Operator state** — not keyed: a source's read offset, a window operator's
+  open windows, a watermark generator's high-water mark. Lives in the operator
+  and is captured through `snapshot_state`.
+
+Defaulted to no-ops because most operators are stateless: map and filter hold
+nothing between records and so say nothing about checkpointing at all.
+
+Stage 7 adds barriers, alignment and a coordinator that **call** these; it does
+not change them. `StateBackend::write_snapshot`/`restore_snapshot` are already
+implemented and tested, since round-tripping a backend is meaningful on its own.
+
+---
+
+### Known gap — keyed windowing
+
+Stage 3's windows are global to the stream and Stage 4's keyed state is not yet
+wired into them, so per-key windows do not exist yet. Stage 9's demo query
+(per-region revenue in 5-minute tumbling windows) needs them.
+
+Deferred deliberately rather than overlooked: the stage brief scoped Stage 4 to
+`keyBy`, backends and serialization. The change is to give `WindowOperator` a key
+selector and nest its window map one level deeper, and it is the first thing to
+do when the demo application is built.
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -722,7 +887,7 @@ exists solely to catch that.
 | 1 | Core dataflow, type erasure | **Complete** — 21 tests, clean under dev/gcc/asan/tsan |
 | 2 | Event time and watermarks | **Complete** — 32 tests, clean under dev/gcc/asan/tsan |
 | 3 | Windowing | **Complete** — 53 tests, clean under dev/gcc/asan/tsan |
-| 4 | Keyed state, backend, serialization | Not started |
+| 4 | Keyed state, backend, serialization | **Complete** — 84 tests, clean under dev/gcc/asan/tsan |
 | 5 | Concurrency primitives | Not started |
 | 6 | Parallelism, partitioning, backpressure | Not started |
 | 7 | Checkpointing (Chandy-Lamport ABS) | Not started |

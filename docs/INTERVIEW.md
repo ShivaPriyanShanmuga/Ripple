@@ -287,6 +287,68 @@ author's request); they are the checklist for the revision pass.
 
 ---
 
+## Stage 4 — Keyed state, state backend, serialization
+
+### Concepts covered
+
+- **Why C++ forces serialization to be designed by hand.** No reflection means
+  no way to ask a type its fields. This is a design task here and a library call
+  in Java.
+- **Three serialization designs and their trade-offs**: trait specialisation
+  (chosen), self-describing tagged formats, macro-generated visitors. See D-034.
+- **The defining hand-rolled-serialization bug**: write and read disagreeing on
+  field count, and why requiring full consumption converts it from silent
+  corruption into an exception.
+- **Wire-format stability**: fixed little-endian, one-byte bool, and why a
+  round-trip test cannot catch an endianness bug on a little-endian machine.
+- **Keys as bytes.** Why the backend erases the key type, and why that makes
+  serialization a prerequisite for keyed state rather than a companion to
+  checkpointing.
+- **Determinism as a checkpointing requirement.** Ordered maps over hash maps so
+  identical state produces identical bytes.
+- **keyed vs. operator state.** Keyed state is partitioned and lives in the
+  backend; operator state (source offsets, window contents) lives in the operator
+  and is captured by `snapshot_state`.
+- **Partitioning instead of locking.** Why keyed state needs no mutex at all, and
+  why a shared map behind a lock does not merely run slower but fails to scale.
+- **Designing for a future requirement without building it** — `snapshot_state`,
+  `restore_state`, `write_snapshot`, `restore_snapshot` all exist and are tested;
+  no barriers, no coordinator, no checkpointing.
+- **Batching vs. write-through persistence**, and why an LSM tree is what a
+  production backend uses.
+
+### Questions to be able to answer cold
+
+1. Why can't C++ generate serialization code the way Java can, and what does
+   that force on the design?
+2. You write three fields and read two. What happens, when do you find out, and
+   what one design decision makes you find out immediately?
+3. Why does the state backend store keys as bytes rather than being templated on
+   the key type?
+4. Why ordered maps rather than hash maps in the backend? What breaks with
+   `unordered_map`?
+5. Keyed state has no mutex anywhere. Why is that safe, and why is the
+   alternative (one map behind a lock) not just slower but unscalable?
+6. What is the difference between keyed state and operator state? Give an
+   example of each and say where each is stored.
+7. Why is `KeyedOperator::process` marked `final`? What bug does that prevent,
+   and why would no type system catch it?
+8. Your file-backed state backend writes through on every state update. What
+   goes wrong at 100k records/sec, and what should it do instead?
+9. A `ValueState<int64_t>` returns `optional`. Why not just return 0 when the key
+   has never been written?
+10. Why does serialization have to be designed in Stage 4 rather than Stage 7,
+    where it is actually used?
+
+### Struggled with — revision list
+
+- **Unverified** — built without the comprehension gate. Questions 2, 5, 6 and 7
+  are the highest-value ones: 5 and 6 are standard interview material, and 2 and
+  7 are the kind of design-reasoning question that distinguishes having built
+  something from having read it.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview
