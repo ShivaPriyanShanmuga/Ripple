@@ -16,7 +16,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -41,7 +40,6 @@ using Output = ripple::KeyedValue<std::string, std::int64_t>;
 
 const auto kZoneOf = [](const Trip& trip) { return trip.zone; };
 const auto kFareOf = [](const Trip& trip) { return trip.fare; };
-const auto kZoneHash = [](const Trip& trip) { return std::hash<std::string>{}(trip.zone); };
 
 std::vector<Record<Trip>> make_trips(const std::vector<std::string>& zones, int per_zone) {
     std::vector<Record<Trip>> trips;
@@ -119,7 +117,7 @@ TEST(ParallelPipelineTest, ProducesIdenticalResultsToTheSingleThreadedPipeline) 
     // --- parallel ---
     ripple::CollectingSink<Output> parallel_sink;
     auto parallel = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 16}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 16}, kZoneOf, make_operator_factory());
     parallel.run(input, parallel_sink);
 
     EXPECT_EQ(by_key(parallel_sink.records()), by_key(sequential_results))
@@ -132,7 +130,7 @@ TEST(ParallelPipelineTest, ProcessesEveryRecordExactlyOnce) {
 
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 8}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 8}, kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     EXPECT_EQ(sink.records().size(), input.size());
@@ -164,7 +162,7 @@ TEST(ParallelPipelineTest, RoutesEveryRecordForAKeyToTheSameSubtask) {
 
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 16}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 16}, kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     // fares are 1..per_zone, so a correct per-zone total is the triangular number.
@@ -191,7 +189,7 @@ TEST(ParallelPipelineTest, ConcentratesAHotKeyOnASingleSubtask) {
 
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 32}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 32}, kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     const auto& per_subtask = pipeline.metrics().records_per_subtask;
@@ -245,7 +243,7 @@ TEST(ParallelPipelineTest, PropagatesBackpressureFromASlowSinkToTheSource) {
     SlowSink sink(std::chrono::microseconds{200});
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
         ParallelConfig{.parallelism = 4, .queue_capacity = 4}, // tiny: pressure builds fast
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     EXPECT_EQ(sink.written(), input.size()) << "backpressure must throttle, never drop";
@@ -267,8 +265,7 @@ TEST(ParallelPipelineTest, DoesNotBlockOnTheSinkQueueWhenTheSinkKeepsUp) {
 
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 256}, kZoneHash,
-        make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 256}, kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     EXPECT_EQ(sink.records().size(), input.size());
@@ -293,7 +290,7 @@ TEST(ParallelPipelineTest, MergesWatermarksAcrossSubtasksByMinimum) {
 
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 16}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 16}, kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     // The source broadcasts one end-of-stream watermark to every subtask, so the
@@ -310,7 +307,7 @@ TEST(ParallelPipelineTest, WorksWithParallelismOfOne) {
 
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 1, .queue_capacity = 4}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 1, .queue_capacity = 4}, kZoneOf, make_operator_factory());
     pipeline.run(input, sink);
 
     EXPECT_EQ(sink.records().size(), input.size());
@@ -322,7 +319,7 @@ TEST(ParallelPipelineTest, WorksWithParallelismOfOne) {
 TEST(ParallelPipelineTest, ShutsDownCleanlyOnEmptyInput) {
     ripple::CollectingSink<Output> sink;
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = 4, .queue_capacity = 4}, kZoneHash, make_operator_factory());
+        ParallelConfig{.parallelism = 4, .queue_capacity = 4}, kZoneOf, make_operator_factory());
     pipeline.run({}, sink);
 
     EXPECT_TRUE(sink.records().empty());

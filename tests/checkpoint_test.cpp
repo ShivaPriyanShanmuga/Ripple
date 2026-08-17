@@ -15,7 +15,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,9 +46,9 @@ CompletedCheckpoint require_latest(const CheckpointCoordinator& coordinator) {
 
 TEST(CheckpointCoordinatorTest, IssuesIncreasingIds) {
     CheckpointCoordinator coordinator(2);
-    EXPECT_EQ(coordinator.trigger(0), 1);
-    EXPECT_EQ(coordinator.trigger(10), 2);
-    EXPECT_EQ(coordinator.trigger(20), 3);
+    EXPECT_EQ(coordinator.trigger(0, 2), 1);
+    EXPECT_EQ(coordinator.trigger(10, 2), 2);
+    EXPECT_EQ(coordinator.trigger(20, 2), 3);
 }
 
 // Protects: a checkpoint is not usable until EVERY task has acknowledged.
@@ -60,7 +59,7 @@ TEST(CheckpointCoordinatorTest, IssuesIncreasingIds) {
 // cut, and exactly-once would be silently untrue.
 TEST(CheckpointCoordinatorTest, DoesNotCompleteUntilEveryTaskAcknowledges) {
     CheckpointCoordinator coordinator(3);
-    const CheckpointId id = coordinator.trigger(100);
+    const CheckpointId id = coordinator.trigger(100, 2);
 
     coordinator.acknowledge(id, 0, ripple::serialize<std::int64_t>(1));
     EXPECT_FALSE(coordinator.is_complete(id));
@@ -77,7 +76,7 @@ TEST(CheckpointCoordinatorTest, DoesNotCompleteUntilEveryTaskAcknowledges) {
 
 TEST(CheckpointCoordinatorTest, RetainsSourceOffsetAndTaskState) {
     CheckpointCoordinator coordinator(2);
-    const CheckpointId id = coordinator.trigger(4'242);
+    const CheckpointId id = coordinator.trigger(4'242, 2);
     coordinator.acknowledge(id, 0, ripple::serialize<std::int64_t>(7));
     coordinator.acknowledge(id, 1, ripple::serialize<std::int64_t>(9));
 
@@ -97,7 +96,7 @@ TEST(CheckpointCoordinatorTest, RetainsSourceOffsetAndTaskState) {
 // describe any single cut at all.
 TEST(CheckpointCoordinatorTest, IgnoresAcknowledgementsForCompletedCheckpoints) {
     CheckpointCoordinator coordinator(2);
-    const CheckpointId id = coordinator.trigger(0);
+    const CheckpointId id = coordinator.trigger(0, 2);
     coordinator.acknowledge(id, 0, ripple::serialize<std::int64_t>(1));
     coordinator.acknowledge(id, 1, ripple::serialize<std::int64_t>(2));
     ASSERT_TRUE(coordinator.is_complete(id));
@@ -111,8 +110,8 @@ TEST(CheckpointCoordinatorTest, IgnoresAcknowledgementsForCompletedCheckpoints) 
 
 TEST(CheckpointCoordinatorTest, TracksMultipleCheckpointsInFlight) {
     CheckpointCoordinator coordinator(2);
-    const CheckpointId first = coordinator.trigger(10);
-    const CheckpointId second = coordinator.trigger(20);
+    const CheckpointId first = coordinator.trigger(10, 2);
+    const CheckpointId second = coordinator.trigger(20, 2);
     EXPECT_EQ(coordinator.pending_count(), 2U);
 
     // Completed out of order, which the algorithm permits: each barrier defines
@@ -141,7 +140,6 @@ using Output = ripple::KeyedValue<std::string, std::int64_t>;
 
 const auto kZoneOf = [](const Trip& trip) { return trip.zone; };
 const auto kFareOf = [](const Trip& trip) { return trip.fare; };
-const auto kZoneHash = [](const Trip& trip) { return std::hash<std::string>{}(trip.zone); };
 
 auto make_operator_factory() {
     return [](std::size_t /*subtask*/, ripple::StateBackend& backend) {
@@ -186,7 +184,7 @@ TEST(CheckpointPipelineTest, CompletesCheckpointsWithoutPausingThePipeline) {
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
         ParallelConfig{
             .parallelism = kParallelism, .queue_capacity = 16, .checkpoint_interval_records = 25},
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
     pipeline.run(input, sink, &coordinator);
 
     EXPECT_EQ(sink.records().size(), input.size()) << "checkpointing must not drop records";
@@ -224,7 +222,7 @@ TEST(CheckpointPipelineTest, EveryCheckpointDescribesAConsistentCut) {
         ParallelConfig{.parallelism = kParallelism,
                        .queue_capacity = 8, // small, so subtasks genuinely diverge
                        .checkpoint_interval_records = 20},
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
     pipeline.run(input, sink, &coordinator);
 
     const auto checkpoints = coordinator.completed();
@@ -256,7 +254,7 @@ TEST(CheckpointPipelineTest, BarriersDoNotOvertakeRecords) {
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
         ParallelConfig{
             .parallelism = kParallelism, .queue_capacity = 4, .checkpoint_interval_records = 30},
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
     pipeline.run(input, sink, &coordinator);
 
     for (const CompletedCheckpoint& checkpoint : coordinator.completed()) {
@@ -296,7 +294,7 @@ TEST(CheckpointPipelineTest, SnapshottedStateRestoresIntoAWorkingBackend) {
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
         ParallelConfig{
             .parallelism = kParallelism, .queue_capacity = 8, .checkpoint_interval_records = 10},
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
     pipeline.run(input, sink, &coordinator);
 
     const CompletedCheckpoint checkpoint = require_latest(coordinator);
@@ -329,7 +327,7 @@ TEST(CheckpointPipelineTest, RunsUnchangedWhenCheckpointingIsDisabled) {
 
     auto pipeline = ripple::make_parallel_pipeline<Trip, Output>(
         ParallelConfig{.parallelism = 4, .queue_capacity = 8, .checkpoint_interval_records = 0},
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
     pipeline.run(input, sink, &coordinator);
 
     EXPECT_EQ(sink.records().size(), input.size());

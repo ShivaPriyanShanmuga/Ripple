@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ripple/serialization.hpp>
+#include <ripple/state/key_group.hpp>
 
 #include <cstddef>
 #include <optional>
@@ -84,6 +85,16 @@ public:
 
     /// Replaces all current contents with the snapshot's.
     virtual void restore_snapshot(ByteReader& reader) = 0;
+
+    /// Reads a snapshot **additively**, keeping only keys whose key group falls
+    /// in `range`.
+    ///
+    /// This is what makes rescaling possible. After a parallelism change one
+    /// subtask's key groups may be spread across several *old* subtasks'
+    /// snapshots, so restore reads every snapshot and each subtask keeps the
+    /// slice it now owns. Additive rather than replacing, because a subtask
+    /// assembles its state from several blobs.
+    virtual void merge_snapshot(ByteReader& reader, KeyGroupRange range) = 0;
 };
 
 } // namespace ripple

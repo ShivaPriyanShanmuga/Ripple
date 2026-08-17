@@ -9,10 +9,10 @@
 
 namespace ripple {
 
-CheckpointId CheckpointCoordinator::trigger(std::size_t source_offset) {
+CheckpointId CheckpointCoordinator::trigger(std::size_t source_offset, std::size_t parallelism) {
     const std::lock_guard<std::mutex> lock(mutex_);
     const CheckpointId id = next_id_++;
-    pending_[id] = CompletedCheckpoint{id, source_offset, {}};
+    pending_[id] = CompletedCheckpoint{id, source_offset, parallelism, {}};
     return id;
 }
 

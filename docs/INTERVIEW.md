@@ -602,6 +602,55 @@ property deliberately, confirm the check fails, restore.
 
 ---
 
+## Stage 8b — Key groups and rescaling
+
+### The idea in one sentence
+
+Partition on a fixed number of hash buckets (`hash(key) % 128`) rather than on
+`hash(key) % parallelism`, and assign *ranges of buckets* to subtasks — so a key
+never changes bucket, only which subtask owns that bucket changes, and a rescale
+redistributes buckets instead of rehashing keys.
+
+### Concepts covered
+
+- **Why `hash % parallelism` makes a stateful job unrescalable.**
+- **Key groups**, the ceiling they impose on parallelism, and why changing the
+  count invalidates every checkpoint.
+- **Why `std::hash` cannot be used** for anything written into a checkpoint: no
+  stability guarantee across processes or implementations.
+- **Operator state vs keyed state on rescale** — keyed state redistributes by
+  group; operator state needs a per-operator merge rule (union-list / split-list).
+- **One key function, not two.** Two independent key functions that must agree is
+  a latent correctness bug with no compiler check.
+- **Exhaustive property tests beat sampled end-to-end tests** for a mapping.
+
+### The demonstration worth describing
+
+Introducing an off-by-one into the group-range function was caught instantly by
+the exhaustive property test — while **the end-to-end rescale tests still
+passed**, because five zones only sample five of 128 groups. A green end-to-end
+test proves only what it exercised.
+
+### Questions to be able to answer cold
+
+1. Why can't you just use `hash(key) % parallelism` in a stateful streaming job?
+2. What is a key group, and what does the count cap?
+3. Why can't the key-group hash be `std::hash`?
+4. What happens to operator state on a rescale, and why is it harder than keyed
+   state?
+5. Your routing function and your state key function are separate. What is the
+   bug, and would any test or compiler catch it?
+6. You have an end-to-end test that rescales successfully. Is the mapping
+   correct?
+
+### Struggled with — revision list
+
+- **Unverified.** Question 1 is the natural follow-up to any exactly-once
+  discussion, and 3 is the kind of detail that signals real implementation
+  experience.
+
+---
+
 ## Cross-stage themes
 
 ### Recurring theme worth naming in an interview

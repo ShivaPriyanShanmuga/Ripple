@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ripple/serialization.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/state/state_backend.hpp>
 
 #include <cstddef>
@@ -71,6 +72,9 @@ public:
     void write_snapshot(ByteWriter& writer) const override {
         detail::write_length(writer, state_.size());
         for (const auto& [key, entries] : state_) {
+            // Each key carries its key group so a restore at a different
+            // parallelism can decide who owns it without re-deriving anything.
+            Serializer<std::uint32_t>::write(writer, static_cast<std::uint32_t>(key_group_of(key)));
             Serializer<StateKey>::write(writer, key);
             detail::write_length(writer, entries.size());
             for (const auto& [name, value] : entries) {
@@ -82,15 +86,30 @@ public:
 
     void restore_snapshot(ByteReader& reader) override {
         clear();
+        merge_snapshot(reader, KeyGroupRange{0, kMaxKeyGroups});
+    }
+
+    void merge_snapshot(ByteReader& reader, KeyGroupRange range) override {
         const auto key_count = static_cast<std::size_t>(reader.read_fixed<std::uint32_t>());
         for (std::size_t i = 0; i < key_count; ++i) {
+            const auto group = static_cast<KeyGroup>(Serializer<std::uint32_t>::read(reader));
             StateKey key = Serializer<StateKey>::read(reader);
             const auto entry_count = static_cast<std::size_t>(reader.read_fixed<std::uint32_t>());
+
             std::map<std::string, std::vector<std::byte>, std::less<>> entries;
             for (std::size_t j = 0; j < entry_count; ++j) {
                 std::string name = Serializer<std::string>::read(reader);
                 std::vector<std::byte> value = Serializer<std::vector<std::byte>>::read(reader);
                 entries.emplace(std::move(name), std::move(value));
+            }
+
+            // Entries outside the range are still *parsed* -- the reader has to
+            // advance past them -- and then discarded. Skipping the parse would
+            // require length-prefixed key-group blocks, which is what a real
+            // engine does so a subtask can seek straight to its own groups
+            // instead of reading everybody's.
+            if (!range.contains(group)) {
+                continue;
             }
             state_.emplace(std::move(key), std::move(entries));
         }

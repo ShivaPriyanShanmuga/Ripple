@@ -1392,6 +1392,72 @@ exactly what a crash does not do.
 
 ---
 
+### D-062 — Key groups: state that survives a rescale
+
+Supersedes the limitation recorded under D-059.
+
+**The problem.** Routing on `hash(key) % parallelism` works until the parallelism
+changes, at which point every key moves and none of them find their state.
+Scaling a stateful job up or down would mean starting from zero.
+
+**Chosen.** A fixed number of hash buckets -- `kMaxKeyGroups = 128` -- decided
+once and **independent of parallelism**. A key's group is
+`hash(key) % kMaxKeyGroups` and never changes; only *which subtask owns that
+group* does. Each subtask owns a contiguous range of groups, snapshots are tagged
+by group, and a restore has every subtask read every old snapshot and keep the
+groups it now owns.
+
+The cost is a ceiling on parallelism -- a job can never have more subtasks than
+key groups, because a group cannot be split. Flink makes the same trade with the
+same default and the same consequence: changing it later invalidates every
+existing checkpoint.
+
+**A latent bug this fixed.** The pipeline previously took a `key_hash`
+(payload → hash) while `KeyedOperator` separately took a `KeySelector`
+(payload → key), and *nothing enforced that the two agreed*. Disagreement would
+route records to a subtask that did not hold their key's state and split the
+results silently. There is now one key selector, and the group is derived from
+the serialized key bytes, so routing and snapshot layout agree by construction
+rather than by convention.
+
+**Why the hash is hand-rolled.** `std::hash` offers no stability guarantee: it may
+be salted per process and certainly differs between standard library
+implementations. A key group is written into a checkpoint and read back by a
+different run, possibly a different build -- an unstable hash would scatter every
+key to a different group on restore and silently lose all state. FNV-1a over the
+serialized bytes is stable, and the test pins literal values so that changing it
+is impossible to do by accident.
+
+**What still does not survive a rescale:** *operator* state, restored only when
+the parallelism is unchanged. Redistributing it needs a per-operator merge rule
+(Flink's union-list and split-list redistribution), and no operator in this engine
+holds any, so the machinery would be untested weight.
+
+**Accepted cost:** the key is serialized twice per record -- once by the pipeline
+to compute the group, once by `KeyedOperator` to scope the state. Correctness and
+a single source of truth first; Stage 9 measures whether it matters.
+
+---
+
+### D-063 — Exhaustive property tests over sampled end-to-end tests
+
+The two directions of the key-group mapping -- "who owns this group" when routing,
+"which groups do I own" when restoring -- must agree at every parallelism. They
+are checked **exhaustively**, over every (parallelism, subtask, group) triple.
+
+That thoroughness is not decorative, and the reason is worth recording. Breaking
+`key_group_range_for` with a floor instead of a ceiling was caught immediately by
+the property tests -- and the **end-to-end rescale tests passed anyway**. With five
+zones they sample five of 128 groups, and none happened to land on the broken
+boundary.
+
+An end-to-end test that samples the space thinly is not a proof. This is the same
+lesson as D-044 (TSan needs genuine contention) and D-056 (alignment verified by
+removing it), arriving from a third direction: *a green test proves only what it
+actually exercised.*
+
+---
+
 ## 4. Stage status
 
 | Stage | Description | Status |
@@ -1404,6 +1470,6 @@ exactly what a crash does not do.
 | 5 | Concurrency primitives | **Complete** — 106 tests, TSan-clean under contention |
 | 6 | Parallelism, partitioning, backpressure | **Complete** — 115 tests, TSan-clean over repeated runs |
 | 7 | Checkpointing (Chandy-Lamport ABS) | **Complete** — 125 tests, alignment verified by disabling it |
-| 8 | Recovery and exactly-once | **Complete** — 132 tests, fault injection at seeded random kill points |
+| 8 | Recovery and exactly-once | **Complete** — 139 tests, fault injection + rescaling via key groups |
 | 9 | Benchmarks and demo application | Not started |
 | 10 | README | Not started |

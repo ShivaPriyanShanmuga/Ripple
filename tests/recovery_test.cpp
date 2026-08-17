@@ -13,7 +13,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -42,7 +41,6 @@ using Output = ripple::KeyedValue<std::string, std::int64_t>;
 
 const auto kZoneOf = [](const Trip& trip) { return trip.zone; };
 const auto kFareOf = [](const Trip& trip) { return trip.fare; };
-const auto kZoneHash = [](const Trip& trip) { return std::hash<std::string>{}(trip.zone); };
 const auto kOutputKey = [](const Output& out) { return out.key; };
 
 using Sink = ripple::IdempotentSink<Output, decltype(kOutputKey)>;
@@ -54,12 +52,12 @@ auto make_operator_factory() {
     };
 }
 
-auto make_pipeline() {
+auto make_pipeline(std::size_t parallelism = kParallelism) {
     return ripple::make_parallel_pipeline<Trip, Output>(
-        ParallelConfig{.parallelism = kParallelism,
+        ParallelConfig{.parallelism = parallelism,
                        .queue_capacity = 8,
                        .checkpoint_interval_records = kCheckpointInterval},
-        kZoneHash, make_operator_factory());
+        kZoneOf, make_operator_factory());
 }
 
 /// Every fare is 1, so a zone's final running total equals the number of trips
@@ -240,6 +238,71 @@ TEST(RecoveryTest, ReplaysFromTheBeginningWhenNoCheckpointCompleted) {
     {
         auto pipeline = make_pipeline();
         pipeline.run(input, sink, &second_run); // no restore: start over
+    }
+
+    EXPECT_EQ(final_totals(sink), expected);
+}
+
+// Protects: a checkpoint taken at one parallelism restores at another.
+//
+// This is what key groups buy. A key's group is `hash(key) % kMaxKeyGroups` and
+// never changes; only which subtask owns that group does. On restore each
+// subtask reads *every* old snapshot and keeps the groups it now owns, so state
+// follows its keys instead of being stranded on a subtask index that no longer
+// means the same thing.
+//
+// Without key groups -- partitioning directly on `hash(key) % parallelism` --
+// every key moves when the parallelism changes and none of them find their
+// state. Scaling up or down would mean starting from zero.
+//
+// Both directions are exercised: scaling down concentrates several old subtasks'
+// groups onto one, scaling up splits one old subtask's groups across several.
+TEST(RecoveryTest, RescalesToADifferentParallelismAcrossACheckpoint) {
+    const std::vector<Record<Trip>> input = make_trips(kZones, 20);
+    const auto expected = uninterrupted_totals(input);
+
+    for (const std::size_t new_parallelism : {1U, 2U, 3U, 7U, 8U}) {
+        CheckpointCoordinator first_run(kParallelism + 1);
+        Sink sink(kOutputKey);
+        {
+            auto pipeline = make_pipeline(kParallelism);
+            pipeline.run(input, sink, &first_run, RunOptions{.fail_after_records = 60});
+        }
+
+        const CompletedCheckpoint checkpoint = require_latest(first_run);
+        ASSERT_EQ(checkpoint.parallelism, kParallelism);
+
+        CheckpointCoordinator second_run(new_parallelism + 1);
+        {
+            auto pipeline = make_pipeline(new_parallelism);
+            pipeline.run(input, sink, &second_run, RunOptions{.restore_from = &checkpoint});
+        }
+
+        EXPECT_EQ(final_totals(sink), expected) << "rescaling from " << kParallelism << " to "
+                                                << new_parallelism << " lost or duplicated state";
+    }
+}
+
+// Protects: rescaling loses nothing even with no failure involved.
+//
+// A clean stop and restart at a different parallelism is the *planned* rescale --
+// the operational case, as opposed to the crash case above.
+TEST(RecoveryTest, RescalesAfterACleanCheckpoint) {
+    const std::vector<Record<Trip>> input = make_trips(kZones, 20);
+    const auto expected = uninterrupted_totals(input);
+
+    CheckpointCoordinator first_run(kParallelism + 1);
+    Sink sink(kOutputKey);
+    {
+        auto pipeline = make_pipeline(kParallelism);
+        pipeline.run(input, sink, &first_run, RunOptions{.fail_after_records = 45});
+    }
+    const CompletedCheckpoint checkpoint = require_latest(first_run);
+
+    CheckpointCoordinator second_run(8 + 1);
+    {
+        auto pipeline = make_pipeline(8);
+        pipeline.run(input, sink, &second_run, RunOptions{.restore_from = &checkpoint});
     }
 
     EXPECT_EQ(final_totals(sink), expected);

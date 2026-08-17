@@ -9,6 +9,7 @@
 #include <ripple/record.hpp>
 #include <ripple/serialization.hpp>
 #include <ripple/sink.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/state/memory_state_backend.hpp>
 #include <ripple/state/state_backend.hpp>
 #include <ripple/watermark.hpp>
@@ -87,13 +88,17 @@ struct RunOptions {
     /// state backend is repopulated from it and the source rewinds to its
     /// offset.
     ///
-    /// **The parallelism must match the run that produced the checkpoint.**
-    /// Subtask *i* restores task *i*'s snapshot, and hash partitioning sends a
-    /// key to `hash(key) % parallelism` -- change the parallelism and keys land
-    /// on subtasks holding somebody else's state. Real engines solve this with
-    /// key groups: a fixed number of hash buckets assigned to subtasks, so
-    /// rescaling redistributes buckets rather than rehashing keys. Out of scope
-    /// here, and the constraint is real rather than an oversight.
+    /// The parallelism **may differ** from the run that produced the
+    /// checkpoint. Keys are routed by key group (a fixed number of hash buckets,
+    /// independent of parallelism), so a rescale redistributes ranges of groups
+    /// rather than rehashing keys. Each subtask reads every old snapshot and
+    /// keeps the groups it now owns.
+    ///
+    /// The one thing that does not survive a rescale is *operator* state, which
+    /// is restored only when the parallelism is unchanged. Redistributing it
+    /// needs a per-operator merge rule -- Flink's union-list and split-list
+    /// redistribution -- and none of this engine's operators hold any, so the
+    /// machinery would be untested weight.
     const CompletedCheckpoint* restore_from = nullptr;
 
     /// Simulate a crash: stop emitting after this many records.
@@ -147,11 +152,11 @@ struct ParallelMetrics {
 ///             |
 ///          sink thread
 /// ```
-template<typename In, typename Out, typename KeyHash, typename OperatorFactory>
+template<typename In, typename Out, typename KeySelector, typename OperatorFactory>
 class ParallelPipeline {
 public:
-    ParallelPipeline(ParallelConfig config, KeyHash key_hash, OperatorFactory make_operator)
-        : config_(config), key_hash_(std::move(key_hash)),
+    ParallelPipeline(ParallelConfig config, KeySelector key_selector, OperatorFactory make_operator)
+        : config_(config), key_selector_(std::move(key_selector)),
           make_operator_(std::move(make_operator)) {}
 
     /// Runs to completion. If `coordinator` is non-null it must have been
@@ -185,18 +190,7 @@ public:
             if (options.restore_from == nullptr) {
                 continue;
             }
-            const auto snapshot = options.restore_from->task_state.find(i);
-            if (snapshot == options.restore_from->task_state.end()) {
-                continue;
-            }
-            // Read in the same order `snapshot_and_acknowledge` wrote: backend
-            // first, then operator state. `deserialize`'s full-consumption rule
-            // (D-034) is what catches the two drifting apart -- silently, a
-            // mismatch here would restore plausible but wrong state, which is
-            // the worst possible outcome during a recovery.
-            ByteReader reader(snapshot->second);
-            backends[i]->restore_snapshot(reader);
-            operators[i]->restore_state(reader);
+            restore_subtask(i, parallelism, *options.restore_from, *backends[i], *operators[i]);
         }
 
         std::vector<std::size_t> records_per_subtask(parallelism, 0);
@@ -231,7 +225,11 @@ public:
                     break;
                 }
                 Record<In>& record = input[index];
-                const std::size_t partition = key_hash_(record.value) % parallelism;
+                // Route by key group, never by `hash % parallelism` directly.
+                // A key's group never changes; only which subtask owns that
+                // group does, which is what makes a rescale possible at all.
+                const StateKey key = serialize(key_selector_(record.value));
+                const std::size_t partition = subtask_for_key_group(key_group_of(key), parallelism);
                 (void)input_queues[partition]->push(StreamElement<In>{0, std::move(record)});
                 ++offset;
 
@@ -240,7 +238,7 @@ public:
                     // The source records its own position *before* the barrier
                     // enters the stream, so the checkpoint's offset and every
                     // snapshot downstream describe the same cut.
-                    const CheckpointId id = coordinator->trigger(offset);
+                    const CheckpointId id = coordinator->trigger(offset, parallelism);
 
                     // Broadcast, not partitioned -- exactly like a watermark. A
                     // barrier is an instruction to every task; routing it to one
@@ -535,17 +533,50 @@ private:
         metrics_.alignment_buffered_elements = sink_task.buffered_count();
     }
 
+    /// Assembles one subtask's state from a checkpoint, which may have been
+    /// taken at a different parallelism.
+    ///
+    /// Every old snapshot is read and each subtask keeps only the key groups it
+    /// now owns. At unchanged parallelism this degenerates to "subtask i reads
+    /// blob i and keeps everything", which is why there is no separate path for
+    /// the common case.
+    static void restore_subtask(std::size_t subtask, std::size_t parallelism,
+                                const CompletedCheckpoint& checkpoint, StateBackend& backend,
+                                Operator<In, Out>& op) {
+        const KeyGroupRange range = key_group_range_for(subtask, parallelism);
+        backend.clear();
+
+        for (const auto& [task, blob] : checkpoint.task_state) {
+            if (task >= checkpoint.parallelism) {
+                continue; // the sink's snapshot, not a keyed subtask's
+            }
+            ByteReader reader(blob);
+            backend.merge_snapshot(reader, range);
+
+            // Operator state was written after the backend's, by the same task.
+            // Only meaningful when the parallelism is unchanged; on a rescale
+            // there is no defined way to redistribute it, so it is dropped.
+            if (task == subtask && checkpoint.parallelism == parallelism) {
+                op.restore_state(reader);
+            }
+        }
+    }
+
     ParallelConfig config_;
-    KeyHash key_hash_;
+    KeySelector key_selector_;
     OperatorFactory make_operator_;
     ParallelMetrics metrics_;
 };
 
-template<typename In, typename Out, typename KeyHash, typename OperatorFactory>
-[[nodiscard]] auto make_parallel_pipeline(ParallelConfig config, KeyHash key_hash,
+/// `key_selector` maps a payload to its key. The **same** function the keyed
+/// operator uses -- passing a separate hash function would let the two disagree,
+/// which would route records to a subtask that does not hold their key's state
+/// and split the results silently.
+template<typename In, typename Out, typename KeySelector, typename OperatorFactory>
+[[nodiscard]] auto make_parallel_pipeline(ParallelConfig config, KeySelector key_selector,
                                           OperatorFactory make_operator) {
-    return ParallelPipeline<In, Out, KeyHash, OperatorFactory>(config, std::move(key_hash),
-                                                               std::move(make_operator));
+    return ParallelPipeline<In, Out, KeySelector, OperatorFactory>(config, std::move(key_selector),
+                                                                   std::move(make_operator));
 }
 
 } // namespace ripple

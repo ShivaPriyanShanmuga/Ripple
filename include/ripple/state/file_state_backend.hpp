@@ -55,6 +55,7 @@ public:
     void clear() override;
     void write_snapshot(ByteWriter& writer) const override;
     void restore_snapshot(ByteReader& reader) override;
+    void merge_snapshot(ByteReader& reader, KeyGroupRange range) override;
 
     /// Writes all state to the file.
     ///

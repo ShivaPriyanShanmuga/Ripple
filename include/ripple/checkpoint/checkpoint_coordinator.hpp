@@ -26,6 +26,14 @@ struct CompletedCheckpoint {
     /// record.
     std::size_t source_offset = 0;
 
+    /// Parallelism of the run that produced this checkpoint.
+    ///
+    /// Needed on restore for two reasons: task ids `[0, parallelism)` are
+    /// subtasks and `parallelism` itself is the sink, and a restore at a
+    /// different parallelism is a **rescale**, which redistributes key groups
+    /// rather than restoring blob-for-blob.
+    std::size_t parallelism = 0;
+
     /// Serialized state per task. Ordered so a checkpoint's contents are
     /// deterministic and comparable, for the same reason the state backend uses
     /// ordered maps (D-037).
@@ -63,7 +71,7 @@ public:
 
     /// Starts a new checkpoint and returns its id. Called by the source, which
     /// then injects a barrier carrying that id.
-    [[nodiscard]] CheckpointId trigger(std::size_t source_offset);
+    [[nodiscard]] CheckpointId trigger(std::size_t source_offset, std::size_t parallelism);
 
     /// Records one task's snapshot. Called from that task's own thread, so this
     /// is the one place in the checkpointing path that needs a lock.

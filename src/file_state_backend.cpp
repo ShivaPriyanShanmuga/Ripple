@@ -1,5 +1,6 @@
 #include <ripple/serialization.hpp>
 #include <ripple/state/file_state_backend.hpp>
+#include <ripple/state/key_group.hpp>
 #include <ripple/state/state_backend.hpp>
 
 #include <cstddef>
@@ -52,6 +53,10 @@ void FileStateBackend::write_snapshot(ByteWriter& writer) const {
 
 void FileStateBackend::restore_snapshot(ByteReader& reader) {
     memory_.restore_snapshot(reader);
+}
+
+void FileStateBackend::merge_snapshot(ByteReader& reader, KeyGroupRange range) {
+    memory_.merge_snapshot(reader, range);
 }
 
 void FileStateBackend::flush() const {
